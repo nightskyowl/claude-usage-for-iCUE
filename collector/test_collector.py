@@ -1000,26 +1000,49 @@ class LogFileTruncationTests(unittest.TestCase):
 
 
 class PollSecondsFloorTests(unittest.TestCase):
+    """_resolve_poll_seconds(): the floor and the default are separate numbers
+    since Phase 2b. The default stays 900 so that unsetting the env var is a
+    complete rollback; the floor is what makes a fast opt-in cadence possible."""
+
+    def test_default_is_unchanged_by_phase_2b(self):
+        """Rollback property: with nothing configured, the collector must poll
+        exactly as it did before the floor was lowered."""
+        os.environ.pop("CLAUDE_QUOTA_POLL_SECONDS", None)
+        self.assertEqual(cq._resolve_poll_seconds(), 900)
+        self.assertEqual(cq._DEFAULT_POLL_SECONDS, 900)
+
+    def test_floor_and_default_are_distinct(self):
+        self.assertLess(cq._MIN_POLL_SECONDS, cq._DEFAULT_POLL_SECONDS)
+
     def test_env_below_floor_is_clamped(self):
-        os.environ["CLAUDE_QUOTA_POLL_SECONDS"] = "60"
-        try:
+        with _env("CLAUDE_QUOTA_POLL_SECONDS", "5"):
+            with self.assertLogs(cq.log, level="WARNING"):
+                self.assertEqual(cq._resolve_poll_seconds(), cq._MIN_POLL_SECONDS)
+
+    def test_env_at_floor_is_respected(self):
+        with _env("CLAUDE_QUOTA_POLL_SECONDS", str(cq._MIN_POLL_SECONDS)):
             self.assertEqual(cq._resolve_poll_seconds(), cq._MIN_POLL_SECONDS)
-        finally:
-            del os.environ["CLAUDE_QUOTA_POLL_SECONDS"]
+
+    def test_fast_opt_in_cadence_is_now_permitted(self):
+        """The whole point of Phase 2b: 60s no longer gets clamped to 900."""
+        with _env("CLAUDE_QUOTA_POLL_SECONDS", "60"):
+            self.assertEqual(cq._resolve_poll_seconds(), 60)
+
+    def test_ladder_rungs_are_all_permitted(self):
+        for rung in ("300", "120", "60", "45"):
+            with self.subTest(rung=rung):
+                with _env("CLAUDE_QUOTA_POLL_SECONDS", rung):
+                    self.assertEqual(cq._resolve_poll_seconds(), int(rung))
 
     def test_env_above_floor_is_respected(self):
-        os.environ["CLAUDE_QUOTA_POLL_SECONDS"] = "1800"
-        try:
+        with _env("CLAUDE_QUOTA_POLL_SECONDS", "1800"):
             self.assertEqual(cq._resolve_poll_seconds(), 1800)
-        finally:
-            del os.environ["CLAUDE_QUOTA_POLL_SECONDS"]
 
-    def test_non_integer_env_falls_back_to_floor(self):
-        os.environ["CLAUDE_QUOTA_POLL_SECONDS"] = "not-a-number"
-        try:
-            self.assertEqual(cq._resolve_poll_seconds(), cq._MIN_POLL_SECONDS)
-        finally:
-            del os.environ["CLAUDE_QUOTA_POLL_SECONDS"]
+    def test_non_integer_env_falls_back_to_default_not_floor(self):
+        """A typo must not silently produce the fastest possible cadence."""
+        with _env("CLAUDE_QUOTA_POLL_SECONDS", "not-a-number"):
+            with self.assertLogs(cq.log, level="WARNING"):
+                self.assertEqual(cq._resolve_poll_seconds(), 900)
 
 
 class DescribeCredentialsTests(unittest.TestCase):
@@ -2239,9 +2262,14 @@ class IsClaudeActiveTests(_ActivityTempTree):
         self.assertFalse(cq.is_claude_active(self.root))
 
     def test_boundary_is_inclusive(self):
-        self._transcript(age_seconds=0)
-        self.assertTrue(cq.is_claude_active(self.root, now=time.time() + 300))
-        self.assertFalse(cq.is_claude_active(self.root, now=time.time() + 301))
+        # Anchor on the transcript's own mtime, not on a freshly re-read
+        # clock: the elapsed time between creating the file and computing
+        # `now` would otherwise push the "exactly at the threshold" case just
+        # past it, making this test flaky.
+        path = self._transcript(age_seconds=0)
+        mtime = os.path.getmtime(path)
+        self.assertTrue(cq.is_claude_active(self.root, now=mtime + 300))
+        self.assertFalse(cq.is_claude_active(self.root, now=mtime + 301))
 
     def test_missing_tree_fails_open_to_active(self):
         """A user whose transcripts live elsewhere must keep the old cadence,
@@ -2451,6 +2479,126 @@ class IdleConfigEnvTests(unittest.TestCase):
     def test_valid_override_is_honoured(self):
         with _env("CLAUDE_QUOTA_TEST_INT", "120"):
             self.assertEqual(cq._env_int("CLAUDE_QUOTA_TEST_INT", 300, 60), 120)
+
+
+class BackoffDecouplingTests(unittest.TestCase):
+    """The 429 backoff must retreat just as steeply no matter how fast the
+    collector was polling when it tripped. Phase 2b makes fast cadences
+    reachable, so a backoff derived from POLL_SECONDS would fire many more
+    requests into an already-angry endpoint."""
+
+    def setUp(self):
+        self._orig = (cq.POLL_SECONDS, cq._consecutive_429s, cq._last_retry_after)
+        cq._consecutive_429s = 0
+        cq._last_retry_after = None
+
+        def restore():
+            cq.POLL_SECONDS, cq._consecutive_429s, cq._last_retry_after = self._orig
+
+        self.addCleanup(restore)
+
+    def _ladder(self, poll_seconds, rungs=8):
+        cq.POLL_SECONDS = poll_seconds
+        cq._consecutive_429s = 0
+        return [cq.next_poll_delay("429") for _ in range(rungs)]
+
+    def test_slow_cadence_ladder_is_unchanged(self):
+        """Regression guard: at the historical 900s cadence the ladder must be
+        exactly what it has always been."""
+        self.assertEqual(self._ladder(900, 3), [1800, 3600, 7200])
+
+    def test_fast_cadence_uses_the_same_ladder(self):
+        for cadence in (45, 60, 120, 300):
+            with self.subTest(cadence=cadence):
+                self.assertEqual(self._ladder(cadence, 3), [1800, 3600, 7200])
+
+    def test_fast_cadence_reaches_the_cap_in_three_failures_not_eight(self):
+        """The specific bug this prevents: POLL_SECONDS * 2**n at P=45 needed
+        eight 429s to reach the 2h ceiling."""
+        ladder = self._ladder(45, 8)
+        self.assertEqual(ladder.index(cq._MAX_BACKOFF_SECONDS), 2)
+        self.assertTrue(all(d == cq._MAX_BACKOFF_SECONDS for d in ladder[2:]))
+
+    def test_backoff_never_shorter_than_the_polling_cadence(self):
+        """A cadence slower than the backoff base must still win."""
+        self.assertEqual(self._ladder(3600, 1), [7200])
+
+    def test_success_resets_the_ladder(self):
+        self._ladder(45, 2)
+        self.assertEqual(cq.next_poll_delay("ok"), 45)
+        self.assertEqual(cq.next_poll_delay("429"), 1800)
+
+
+class RetryAfterTests(unittest.TestCase):
+    """Retry-After is the only authoritative statement we ever get about this
+    undocumented limit, so a longer one overrides our guessed ladder."""
+
+    def setUp(self):
+        self._orig = (cq.POLL_SECONDS, cq._consecutive_429s, cq._last_retry_after)
+        cq.POLL_SECONDS = 900
+        cq._consecutive_429s = 0
+        cq._last_retry_after = None
+
+        def restore():
+            cq.POLL_SECONDS, cq._consecutive_429s, cq._last_retry_after = self._orig
+
+        self.addCleanup(restore)
+
+    class _Err:
+        def __init__(self, value):
+            self.headers = {"Retry-After": value} if value is not None else {}
+
+    def test_parses_delta_seconds(self):
+        self.assertEqual(cq._parse_retry_after(self._Err("120")), 120)
+
+    def test_tolerates_surrounding_whitespace(self):
+        self.assertEqual(cq._parse_retry_after(self._Err("  90 ")), 90)
+
+    def test_absent_header_is_none(self):
+        self.assertIsNone(cq._parse_retry_after(self._Err(None)))
+
+    def test_http_date_form_is_ignored_rather_than_half_parsed(self):
+        self.assertIsNone(
+            cq._parse_retry_after(self._Err("Wed, 21 Oct 2026 07:28:00 GMT"))
+        )
+
+    def test_garbage_and_nonpositive_values_are_ignored(self):
+        for value in ("soon", "", "0", "-5"):
+            with self.subTest(value=value):
+                self.assertIsNone(cq._parse_retry_after(self._Err(value)))
+
+    def test_absurd_value_is_capped(self):
+        self.assertEqual(
+            cq._parse_retry_after(self._Err("999999")), cq._MAX_RETRY_AFTER_SECONDS
+        )
+
+    def test_missing_headers_attribute_never_raises(self):
+        self.assertIsNone(cq._parse_retry_after(object()))
+
+    def test_longer_retry_after_overrides_the_ladder(self):
+        cq._last_retry_after = 3000
+        with self.assertLogs(cq.log, level="INFO") as ctx:
+            self.assertEqual(cq.next_poll_delay("429"), 3000)
+        self.assertTrue(any("honouring it" in line for line in ctx.output))
+
+    def test_shorter_retry_after_does_not_shorten_the_ladder(self):
+        """Being invited back early is not a reason to abandon our own, more
+        conservative, retreat."""
+        cq._last_retry_after = 10
+        self.assertEqual(cq.next_poll_delay("429"), 1800)
+
+    def test_retry_after_does_not_leak_into_non_429_delays(self):
+        cq._last_retry_after = 3000
+        self.assertEqual(cq.next_poll_delay("ok"), 900)
+        self.assertEqual(cq.next_poll_delay("other"), 900)
+
+    def test_fetch_error_carries_retry_after(self):
+        err = cq.FetchError("HTTP 429", status_code=429, retry_after=42)
+        self.assertEqual(err.retry_after, 42)
+        self.assertEqual(err.status_code, 429)
+
+    def test_fetch_error_retry_after_defaults_to_none(self):
+        self.assertIsNone(cq.FetchError("boom").retry_after)
 
 
 class ActivityDiagTests(_ActivityTempTree):

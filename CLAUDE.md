@@ -15,9 +15,21 @@ progress bars with percentage and reset time.
      `Authorization: Bearer <token>` and `anthropic-beta: oauth-2025-04-20`
    - Writes normalized `data/latest.json` with `utilization` (0–100) and `resets_at`
      (ISO 8601) for both windows.
-   - **Polls no more often than every 15 minutes** (endpoint is aggressively rate limited).
-     `_MIN_POLL_SECONDS = 900` is a **hard floor**: `CLAUDE_QUOTA_POLL_SECONDS` below it is
-     warned about and clamped, so setting it to e.g. 60 silently has no effect.
+   - **Default cadence is 15 minutes** (endpoint is aggressively rate limited). Since
+     Phase 2b the floor and the default are **separate numbers**:
+     `_DEFAULT_POLL_SECONDS = 900` is what you get with nothing configured, and
+     `_MIN_POLL_SECONDS = 45` is the hard floor for an explicit `CLAUDE_QUOTA_POLL_SECONDS`
+     opt-in (below it, warned about and clamped; a non-integer falls back to the *default*,
+     never the floor, so a typo can't silently produce the fastest possible cadence).
+     Keeping the default at 900 is what makes rollback free: removing the env var fully
+     reverts the polling rate with no code change (`collector/rollback_cadence.bat`).
+   - **429 backoff is deliberately decoupled from `POLL_SECONDS`**: the ladder is
+     `max(POLL_SECONDS, _MIN_BACKOFF_BASE_SECONDS=900) * 2**n`, capped at 2 h. Basing it on
+     `POLL_SECONDS` alone (as it originally was) meant a fast cadence also made the retreat
+     from a rate limit shallow — at 45 s it would take *eight* 429s to reach the 2 h cap
+     instead of three, i.e. eight requests into an endpoint that has already said no.
+     A `Retry-After` header is honoured when it asks for **longer** than the ladder; a
+     shorter one is ignored, since the ladder is the more conservative of the two.
    - **Reset-aware scheduling**: on a successful cycle the next poll is pulled forward to
      just after the soonest upcoming `resets_at` (+15 s grace, floored at 60 s) when that
      lands sooner than the normal interval. This fixes the one visibly-wrong state — a

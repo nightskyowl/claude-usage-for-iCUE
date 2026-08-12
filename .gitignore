@@ -27,3 +27,8 @@ Thumbs.db
 
 # --- Local Claude session files ---
 .claude/
+
+# --- Stray packaging output ---
+# `icuewidget package widget/ClaudeQuota` writes the archive next to the source
+# folder; the committed artifact lives at dist/ClaudeQuota.icuewidget instead.
+widget/*.icuewidget

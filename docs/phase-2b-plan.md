@@ -1,7 +1,37 @@
 # Phase 2b — sub-60-second glass latency
 
-**Status: planned, not started. Requires explicit go-ahead before any step.**
-Phase 2a (activity-driven idle pausing) shipped and was verified live on 2026-08-12.
+**Status: started 2026-08-12. Prerequisites done; live on rung 1 (300 s).**
+
+| | State |
+|---|---|
+| Prerequisite code | ✅ done — floor/default split, backoff decoupled, `Retry-After` honoured |
+| Widget | ✅ 1.0.4 deployed (`W` = 2 s) — **needs an iCUE tray quit + relaunch to take effect** |
+| Cadence | ✅ rung 1 live: `CLAUDE_QUOTA_POLL_SECONDS=300` (persistent user env var) |
+| Next | observe ≥24 h for 429s, then rung 2 (120 s) |
+
+Phase 2a (activity-driven idle pausing) shipped earlier the same day and was confirmed in
+production at 19:53–19:57: the collector held polls for 1125 s while idle and resumed
+within one 15 s slice when a transcript was written again.
+
+## Rollback — three levels, fastest first
+
+Level 1 covers anything cadence-related, which is every failure mode this phase can
+plausibly introduce. It has been tested end to end, not just written.
+
+| Level | What it undoes | How | Needs iCUE restart? |
+|---|---|---|---|
+| **1. Cadence** | the faster polling | `collector\rollback_cadence.bat` | no |
+| **2. Code** | all 2b code changes | `git checkout phase-2a-stable` | no |
+| **3. Widget** | widget 1.0.4 → 1.0.3 | copy `%LOCALAPPDATA%\ClaudeQuotaBackups\widget-1.0.3-<guid>\*` over `%APPDATA%\Corsair\CUE5\html_widgets\<guid>\` | **yes — tray quit** |
+
+Level 1 works without any code change because the *default* cadence is still 900 s; the
+fast cadence is purely an opt-in env var. Removing that variable is a complete rollback of
+the polling rate, and everything else (idle pausing, reset-aware scheduling, the decoupled
+backoff) is cadence-independent and keeps working.
+
+Known-good restore points:
+- git tag **`phase-2a-stable`** (pushed to origin) — the last commit before 2b
+- widget 1.0.3 folder backup at `%LOCALAPPDATA%\ClaudeQuotaBackups\widget-1.0.3-<guid>`
 
 ## The target, stated precisely
 
@@ -83,10 +113,20 @@ One rung at a time. Each rung runs for at least a full day of normal use before 
 | Rung | `CLAUDE_QUOTA_POLL_SECONDS` | Glass latency (worst) | Gate to advance |
 |---|---|---|---|
 | 0 | unset (900) | 15 m | 2a stable, idle holds observed in the log ✅ |
-| 1 | 300 | ~5 m | no 429 in `collector.log` for 24 h |
+| 1 | 300 | ~5 m | **← live since 2026-08-12 20:10.** no 429 in `collector.log` for 24 h |
 | 2 | 120 | ~2 m | no 429 for 24 h |
-| 3 | 60 | ~65 s | no 429 for 24 h |
-| 4 | 45 (+ W=2 s) | **~47 s** ✓ | target reached |
+| 3 | 60 | ~62 s | no 429 for 24 h |
+| 4 | 45 | **~47 s** ✓ | target reached |
+
+Rungs 3 and 4 assume widget 1.0.4 (`W`=2 s) is actually loaded — until iCUE has been
+restarted from the tray, add 3 s to every latency figure above.
+
+Advancing a rung is two commands, no code change and no redeploy:
+
+```bat
+setx CLAUDE_QUOTA_POLL_SECONDS 120
+collector\restart_collector.bat
+```
 
 **Abort criterion:** a single 429 in `collector.log` that is not explained by an auth
 storm or repeated restarts → drop back one rung and stay there. The endpoint is

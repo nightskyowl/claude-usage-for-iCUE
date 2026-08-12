@@ -46,20 +46,29 @@ logging.basicConfig(
 )
 log = logging.getLogger("claude_quota")
 
-_MIN_POLL_SECONDS = 900  # hard floor: the endpoint rate-limits aggressively
+# The cadence used when nothing is configured. Deliberately unchanged by
+# Phase 2b: a faster cadence is opt-in via CLAUDE_QUOTA_POLL_SECONDS, so
+# unsetting one environment variable is a complete rollback, with no code
+# change and nothing to redeploy.
+_DEFAULT_POLL_SECONDS = 900
+# Hard floor for an explicit opt-in. Lowered from 900 in Phase 2b to make
+# sub-60-second end-to-end glass latency reachable (collector interval +
+# widget interval + render). The floor still exists because the endpoint is
+# undocumented and the collector runs unattended forever.
+_MIN_POLL_SECONDS = 45
 
 
 def _resolve_poll_seconds() -> int:
-    raw = os.environ.get("CLAUDE_QUOTA_POLL_SECONDS", str(_MIN_POLL_SECONDS))
+    raw = os.environ.get("CLAUDE_QUOTA_POLL_SECONDS", str(_DEFAULT_POLL_SECONDS))
     try:
         value = int(raw)
     except ValueError:
         log.warning(
             "CLAUDE_QUOTA_POLL_SECONDS=%r is not an integer; using default %d",
             raw,
-            _MIN_POLL_SECONDS,
+            _DEFAULT_POLL_SECONDS,
         )
-        return _MIN_POLL_SECONDS
+        return _DEFAULT_POLL_SECONDS
     if value < _MIN_POLL_SECONDS:
         log.warning(
             "CLAUDE_QUOTA_POLL_SECONDS=%d is below the %d-second floor; clamping to %d",
@@ -311,9 +320,48 @@ class FetchError(Exception):
     The message must never contain the token or any fragment of it.
     """
 
-    def __init__(self, message: str, status_code: Optional[int] = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        status_code: Optional[int] = None,
+        retry_after: Optional[int] = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        # Seconds requested by the server's Retry-After header, when it sent
+        # one and it was parseable. The server's own number always beats our
+        # guessed backoff ladder.
+        self.retry_after = retry_after
+
+
+# A server that tells us when to come back is more authoritative than any
+# ladder we invent, so Retry-After is honoured when present. Capped so a
+# hostile or garbled value cannot park the collector indefinitely; the cap is
+# the same 2h ceiling the exponential backoff already tops out at.
+_MAX_RETRY_AFTER_SECONDS = 7200
+
+
+def _parse_retry_after(exc: Any) -> Optional[int]:
+    """Extract a Retry-After delay (seconds) from an HTTPError, or None.
+
+    Handles the delta-seconds form only ("120"); the HTTP-date form is
+    deliberately ignored rather than half-parsed, since falling back to our
+    own backoff is safe and date parsing here would add a clock-skew failure
+    mode for no real benefit. Never raises.
+    """
+    try:
+        raw = exc.headers.get("Retry-After")
+    except Exception:  # noqa: BLE001 - malformed/absent headers must not crash a poll
+        return None
+    if raw is None:
+        return None
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+    return min(value, _MAX_RETRY_AFTER_SECONDS)
 
 
 def read_credentials(path: Path) -> dict:
@@ -456,7 +504,11 @@ def fetch_usage_payload(token: str) -> Any:
             status = response.getcode()
             body = response.read()
     except urllib.error.HTTPError as exc:
-        raise FetchError(f"HTTP {exc.code}", status_code=exc.code)
+        raise FetchError(
+            f"HTTP {exc.code}",
+            status_code=exc.code,
+            retry_after=_parse_retry_after(exc),
+        )
     except urllib.error.URLError as exc:
         raise FetchError(f"network error ({exc.reason.__class__.__name__})")
     except TimeoutError:
@@ -784,6 +836,23 @@ _auth_latch: dict = {"active": False, "mtime": None}
 _consecutive_429s = 0
 _MAX_BACKOFF_SECONDS = 7200
 
+# Floor for the exponential backoff base, deliberately INDEPENDENT of
+# POLL_SECONDS.
+#
+# The backoff used to be POLL_SECONDS * 2**n, which silently coupled the
+# retreat from a rate limit to the polling cadence. At the old fixed 900s
+# cadence that ladder reached the 2h cap in three failures. Once Phase 2b
+# allows an opt-in 45s cadence the same expression would need *eight*
+# failures to get there -- eight requests fired into an endpoint that has
+# already said no, precisely when it is angriest. Basing the ladder on
+# max(POLL_SECONDS, this) keeps the retreat exactly as steep as it is today
+# no matter how fast the collector is polling when it trips.
+_MIN_BACKOFF_BASE_SECONDS = 900
+
+# Retry-After (seconds) reported by the most recent 429, when the server sent
+# a parseable one. Reset on any non-429 outcome.
+_last_retry_after: Optional[int] = None
+
 # Kind of the most recent poll_once() outcome: "ok" | "429" | "auth" | "other".
 # Read by poller_loop() (via next_poll_delay()) to decide the next delay.
 _last_poll_status = "ok"
@@ -805,7 +874,7 @@ def poll_once(path: Path = None) -> dict:
     "429" | "auth" | "other") for next_poll_delay(), and maintains the
     auth-failure latch (see _auth_latch docs above).
     """
-    global _last_poll_status
+    global _last_poll_status, _last_retry_after
     path = path or DATA_PATH
 
     if _auth_latch["active"]:
@@ -835,6 +904,7 @@ def poll_once(path: Path = None) -> dict:
             _fmt_util(result.get("seven_day")),
         )
         if _is_auth_failure(exc):
+            _last_retry_after = None
             _auth_latch["active"] = True
             _auth_latch["mtime"] = _credentials_mtime(CREDENTIALS_PATH)
             _last_poll_status = "auth"
@@ -845,19 +915,23 @@ def poll_once(path: Path = None) -> dict:
             else:
                 log.info(describe_credentials(creds_data))
         elif exc.status_code == 429:
+            _last_retry_after = exc.retry_after
             _last_poll_status = "429"
         else:
+            _last_retry_after = None
             _last_poll_status = "other"
         return result
     except Exception as exc:  # noqa: BLE001 - never crash the poller
         result = write_failure(path, f"unexpected error ({exc.__class__.__name__})")
         log.exception("poll failed with unexpected error")
+        _last_retry_after = None
         _last_poll_status = "other"
         return result
     else:
         write_success(path, normalized)
         _auth_latch["active"] = False
         _auth_latch["mtime"] = None
+        _last_retry_after = None
         _last_poll_status = "ok"
         log.info(
             "poll ok: 5h=%s 7d=%s",
@@ -958,7 +1032,21 @@ def next_poll_delay(
     global _consecutive_429s
     if status_kind == "429":
         _consecutive_429s += 1
-        delay = min(POLL_SECONDS * (2 ** _consecutive_429s), _MAX_BACKOFF_SECONDS)
+        base = max(POLL_SECONDS, _MIN_BACKOFF_BASE_SECONDS)
+        delay = min(base * (2 ** _consecutive_429s), _MAX_BACKOFF_SECONDS)
+        if _last_retry_after is not None and _last_retry_after > delay:
+            # The server named a longer wait than our ladder. Obey it: it is
+            # the only authoritative statement about this undocumented limit
+            # we ever get. A *shorter* Retry-After is deliberately ignored --
+            # our ladder is the more conservative of the two, and being
+            # invited back early is not a reason to abandon it.
+            log.info(
+                "server asked for %ds before retrying; honouring it over the "
+                "%ds backoff",
+                _last_retry_after,
+                delay,
+            )
+            delay = _last_retry_after
         if delay > POLL_SECONDS:
             log.info("backing off: next poll in %d minutes", delay // 60)
         return delay

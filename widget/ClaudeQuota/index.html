@@ -77,7 +77,13 @@
     // Kept deliberately short: this only re-reads the collector's local JSON, so it adds
     // no load on Anthropic's API. It exists purely to shrink the gap between the collector
     // writing fresh data and the display showing it.
-    var REFRESH_INTERVAL_MS = 5000;
+    //
+    // This is the "W" term in the end-to-end latency budget (see docs/phase-2b-plan.md):
+    //   worst-case glass latency = collector interval + W + render.
+    // Because W is free — localhost only, zero API cost — it is spent first, so the
+    // collector's interval (the term that actually costs requests) can stay as high as
+    // possible for a given latency target.
+    var REFRESH_INTERVAL_MS = 2000;
     // Fast retry cadence used at logon (before the collector is up) and whenever the
     // last fetch failed — avoids sitting on "Collector offline" for a full 60s.
     var FAST_RETRY_MS = 5000;
