@@ -54,6 +54,37 @@ progress bars with percentage and reset time.
 - Model policy: Sonnet implements clearly-specified tasks; Fable (or the strongest available
   model) plans, reviews, approves/denies, and sends work back with feedback.
 
+## Operational lessons (learned the hard way — do not re-learn)
+
+- **Verified live on 2026-08-12**: `/api/oauth/usage` returned `utilization` as plain
+  percent (46.0, 8.0) with ISO `resets_at`. Percent-as-is normalization is correct.
+- **Token refresh endpoint** (`console.anthropic.com/v1/oauth/token`) sits behind
+  Cloudflare: requests without a real `User-Agent` get **403**. Always send the same
+  header set as the usage call (`User-Agent`, `Accept`, `anthropic-beta`).
+- Refresh responses: **400/401 = refresh token invalid** (user must `claude` → `/login`);
+  403 = blocked request, not an auth problem.
+- The usage endpoint **429s quickly** after repeated bad-auth hits and stays angry for
+  a while. Collector has exponential backoff (cap 2 h), an **auth latch** (after a 401
+  it stops calling out until the credentials file mtime changes), and a restart guard
+  (skips the immediate startup poll if the last result was a fresh 429). Restarting
+  the collector repeatedly is safe.
+- **Claude Code can "look logged in" while its credentials file is dead** (user runs it
+  inside Antigravity, which may inject its own API key). expiresAt was 19 days stale
+  with an empty refreshToken. Fix is always: `claude` → `/login` in a Windows shell.
+- **Microsoft Store `python` stub**: `where python` succeeds but running it prints
+  "Python was not found" (exit 9009). All .bat launchers must probe interpreters by
+  EXECUTING them (`X -c "raise SystemExit(0)"`), order: pythonw → pyw -3 → py -3 →
+  python; always `start ""` detached so closing the window can't kill the collector.
+- **Tests run in a sandbox that mounts the real repo folder** — the suite has a
+  fail-loud guard so it can never write to the real `collector/collector.log` or
+  `data/`. Keep that guard when adding tests.
+- `collector/diagnose.bat` → `data/diag.json`: sanitized credential state (never token
+  text), Credential Manager targets, scheduled-task state, running collector PIDs.
+  This is the first tool to reach for on any "no data" report.
+- Startup: `install_startup.bat` registers Task Scheduler task `ClaudeQuotaCollector`
+  (ONLOGON, validated full interpreter path). The Claude desktop app does NOT need to
+  auto-start — the collector is self-sufficient once a valid refresh token exists.
+
 ## Endpoint response shape (normalize defensively)
 
 `/api/oauth/usage` returns JSON including `five_hour` and `seven_day` objects, each with

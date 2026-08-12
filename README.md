@@ -49,6 +49,8 @@ Built with the official [Corsair iCUE Widget Builder skill](https://github.com/C
 
 ## Troubleshooting
 
+- **First stop for any problem**: run `collector/diagnose.bat`, then read `data/diag.json`
+  (sanitized — no secrets) and `collector/collector.log`.
 - **Widget shows `--%` / "Collector offline"** — the collector isn't running or the port
   is taken. Run `collector/restart_collector.bat` and check `collector/collector.log`.
 - **`data/latest.json` says `HTTP 401`** — the access token expired. The collector now
