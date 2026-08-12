@@ -39,6 +39,15 @@ progress bars with percentage and reset time.
    **Holds no tokens, never calls Anthropic directly.** Re-reads `latest.json` every
    **5 s** (`REFRESH_INTERVAL_MS`); this is localhost-only traffic and adds zero API load,
    so it is deliberately decoupled from the collector's 15-minute cadence.
+   - A **1 Hz tick** (`renderLive()`) repaints only time-derived text: the reset countdown
+     and the data-age line. It touches no bar geometry or colors, so it can never restart
+     the `width`/`background-color` CSS transitions. Costs zero network traffic of any kind.
+   - **Reset line**: countdown (`Resets in 4m 12s`) when the boundary is under 24 h away,
+     seconds precision under an hour; absolute wall clock beyond a day, when `resets_at` is
+     already past (stale snapshot), and never rendered at all when it is null.
+   - **Never interpolate the percentage between polls.** A projected quota figure that reads
+     high causes needless throttling and one that reads low walks the user into the cap. The
+     countdown supplies the live-motion feel without inventing data.
 
 ## Security rules
 

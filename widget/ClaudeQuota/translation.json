@@ -13,7 +13,10 @@
       "Stale": "Stale",
       "5-Hour Window": "5-Hour Window",
       "Weekly Window": "Weekly Window",
-      "Resets {value}": "Resets {value}"
+      "Resets {value}": "Resets {value}",
+      "Resets in {value}": "Resets in {value}",
+      "Updated {value} ago": "Updated {value} ago",
+      "Just now": "Just now"
     }
   }
 }

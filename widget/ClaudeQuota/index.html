@@ -38,6 +38,7 @@
 
       <div class="content">
         <div class="top-bar">
+          <span class="freshness"></span>
           <span class="stale-badge">Stale</span>
           <span class="offline-banner">Collector offline</span>
         </div>
@@ -92,6 +93,13 @@
     var fetchTimer = null;
     var fetchInFlight = false;
     var resetsTemplate = 'Resets {value}';
+    var resetsInTemplate = 'Resets in {value}';
+    var updatedTemplate = 'Updated {value} ago';
+    var justNowText = 'Just now';
+    // 1 Hz repaint of the time-derived text only (countdown + data age). Costs no
+    // network traffic of any kind — it re-reads clocks, never the collector.
+    var tickTimer = null;
+    var LIVE_TICK_MS = 1000;
 
     // English fallback dictionary — used outside iCUE (plain browser preview)
     // where the async tr() global is not injected. Mirrors translation.json's "en" block.
@@ -101,7 +109,10 @@
       'Stale': 'Stale',
       '5-Hour Window': '5-Hour Window',
       'Weekly Window': 'Weekly Window',
-      'Resets {value}': 'Resets {value}'
+      'Resets {value}': 'Resets {value}',
+      'Resets in {value}': 'Resets in {value}',
+      'Updated {value} ago': 'Updated {value} ago',
+      'Just now': 'Just now'
     };
 
     function trText(key) {
@@ -149,12 +160,19 @@
         trText('Stale'),
         trText('5-Hour Window'),
         trText('Weekly Window'),
-        trText('Resets {value}')
+        trText('Resets {value}'),
+        trText('Resets in {value}'),
+        trText('Updated {value} ago'),
+        trText('Just now')
       ]).then(function (vals) {
         var loadingText = vals[0], offlineText = vals[1], staleText = vals[2],
-            fiveHourLabel = vals[3], weeklyLabel = vals[4], resetsTpl = vals[5];
+            fiveHourLabel = vals[3], weeklyLabel = vals[4], resetsTpl = vals[5],
+            resetsInTpl = vals[6], updatedTpl = vals[7], justNowTxt = vals[8];
 
         resetsTemplate = resetsTpl || 'Resets {value}';
+        resetsInTemplate = resetsInTpl || 'Resets in {value}';
+        updatedTemplate = updatedTpl || 'Updated {value} ago';
+        justNowText = justNowTxt || 'Just now';
 
         var loadingEl = document.querySelector('.loading-state');
         if (loadingEl) loadingEl.textContent = loadingText;
@@ -214,23 +232,65 @@
     }
 
     // --- Reset time formatting (local time via Intl.DateTimeFormat) ---
-    function formatResetLine(iso) {
-      if (!iso) return '';
-      var d = new Date(iso);
-      if (isNaN(d.getTime())) return '';
+    function absoluteResetValue(d) {
       var now = new Date();
       var sameDay = d.getFullYear() === now.getFullYear() &&
                     d.getMonth() === now.getMonth() &&
                     d.getDate() === now.getDate();
       var timeStr = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit', hour12: false }).format(d);
-      var valueStr;
-      if (sameDay) {
-        valueStr = timeStr;
-      } else {
-        var weekday = new Intl.DateTimeFormat(undefined, { weekday: 'short' }).format(d);
-        valueStr = weekday + ' ' + timeStr;
-      }
-      return resetsTemplate.replace('{value}', valueStr);
+      if (sameDay) return timeStr;
+      var weekday = new Intl.DateTimeFormat(undefined, { weekday: 'short' }).format(d);
+      return weekday + ' ' + timeStr;
+    }
+
+    // Coarsens as the horizon grows: seconds only matter when the reset is
+    // imminent, and "3h 22m 07s" would just be noise.
+    function formatCountdown(totalSec) {
+      if (totalSec < 60) return totalSec + 's';
+      if (totalSec < 3600) return Math.floor(totalSec / 60) + 'm ' + (totalSec % 60) + 's';
+      return Math.floor(totalSec / 3600) + 'h ' + Math.floor((totalSec % 3600) / 60) + 'm';
+    }
+
+    function formatResetLine(iso) {
+      // resets_at is nullable in the SUCCESS path: right after a window rolls
+      // over the API reports utilization 0 with no next boundary until the
+      // window restarts. Render nothing rather than "Invalid Date".
+      if (!iso) return '';
+      var d = new Date(iso);
+      if (isNaN(d.getTime())) return '';
+
+      var deltaSec = Math.floor((d.getTime() - Date.now()) / 1000);
+
+      // Past due: the window should have rolled over but our snapshot predates
+      // it. A negative countdown would be nonsense, so fall back to the wall
+      // clock — the freshness line already explains why the figure is behind.
+      if (deltaSec <= 0) return resetsTemplate.replace('{value}', absoluteResetValue(d));
+
+      // Beyond a day out a countdown is neither actionable nor visibly live
+      // (this is the weekly window for most of its cycle) — the wall clock
+      // reads better. Inside a day, count down.
+      if (deltaSec >= 86400) return resetsTemplate.replace('{value}', absoluteResetValue(d));
+
+      return resetsInTemplate.replace('{value}', formatCountdown(deltaSec));
+    }
+
+    // --- Data age: how stale the displayed figures actually are ---
+    // Turns the binary Stale badge into continuous, honest information. While
+    // the collector is offline this keeps climbing against the last good
+    // payload, which is exactly the signal you want.
+    function formatFreshness(iso) {
+      if (!iso) return '';
+      var d = new Date(iso);
+      if (isNaN(d.getTime())) return '';
+      var ageSec = Math.floor((Date.now() - d.getTime()) / 1000);
+      if (ageSec < 0) ageSec = 0; // clock skew between collector and display
+      if (ageSec < 10) return justNowText;
+      var value;
+      if (ageSec < 60) value = ageSec + 's';
+      else if (ageSec < 3600) value = Math.floor(ageSec / 60) + 'm';
+      else if (ageSec < 86400) value = Math.floor(ageSec / 3600) + 'h';
+      else value = Math.floor(ageSec / 86400) + 'd';
+      return updatedTemplate.replace('{value}', value);
     }
 
     // --- Bar color thresholds (fixed regardless of accentColor) ---
@@ -249,14 +309,31 @@
       var resetEl = row.querySelector('.row-reset');
 
       var util = windowData && typeof windowData.utilization !== 'undefined' ? clampPercent(windowData.utilization) : null;
-      var resetsAt = windowData ? windowData.resets_at : null;
 
       if (percentEl) percentEl.textContent = util === null ? '--%' : Math.round(util) + '%';
       if (fillEl) {
         fillEl.style.width = (util === null ? 0 : util) + '%';
         fillEl.style.backgroundColor = fillColor(util);
       }
-      if (resetEl) resetEl.textContent = formatResetLine(resetsAt);
+      if (resetEl) resetEl.textContent = formatResetLine(windowData ? windowData.resets_at : null);
+    }
+
+    // Time-derived text only — no bar geometry, no colors. Safe to run at 1 Hz
+    // because it never touches the properties carrying CSS transitions, so a
+    // tick can't restart the bar animation.
+    function renderLive() {
+      var rows = [
+        ['five_hour', lastGoodData ? lastGoodData.five_hour : null],
+        ['seven_day', lastGoodData ? lastGoodData.seven_day : null]
+      ];
+      for (var i = 0; i < rows.length; i++) {
+        var row = document.querySelector('.quota-row[data-window="' + rows[i][0] + '"]');
+        if (!row) continue;
+        var resetEl = row.querySelector('.row-reset');
+        if (resetEl) resetEl.textContent = formatResetLine(rows[i][1] ? rows[i][1].resets_at : null);
+      }
+      var freshEl = document.querySelector('.freshness');
+      if (freshEl) freshEl.textContent = lastGoodData ? formatFreshness(lastGoodData.fetched_at) : '';
     }
 
     function renderRows() {
@@ -264,6 +341,12 @@
       var sevenDay = lastGoodData ? lastGoodData.seven_day : null;
       renderWindow('five_hour', fiveHour);
       renderWindow('seven_day', sevenDay);
+      renderLive();
+    }
+
+    function startLiveTick() {
+      if (tickTimer) return;
+      tickTimer = setInterval(renderLive, LIVE_TICK_MS);
     }
 
     // --- Data fetch: pure renderer — the ONLY network call this widget ever makes. ---
@@ -312,6 +395,7 @@
     function startPolling() {
       if (pollingStarted) return;
       pollingStarted = true;
+      startLiveTick();
       fetchQuota();
     }
 

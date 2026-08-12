@@ -35,6 +35,21 @@ raising the sustained request rate:
   emptied could keep displaying its old near-100 % figure for another full interval. This
   costs at most one extra request per rollover — a handful per day.
 
+The percentages themselves can only be as fresh as the last poll, so the widget is explicit
+about that rather than pretending otherwise:
+
+- A **live countdown** (`Resets in 4m 12s`) replaces the static clock time whenever a reset is
+  under a day away, ticking every second. It is derived purely from `resets_at` — no API call
+  — so it is genuinely real-time even when the percentage beside it is minutes old.
+- A **data-age line** (`Updated 3m ago`) reports exactly how stale the figures are, replacing
+  a binary "Stale" badge with continuous information. While the collector is offline it keeps
+  climbing against the last good reading.
+
+Deliberately **not** implemented: interpolating or projecting the percentage between polls.
+This gauge exists so you know where you actually stand — a projection that reads high makes
+you throttle work needlessly, and one that reads low walks you into the cap unwarned. A
+frozen figure that is true beats a moving one that is guessed.
+
 ## Requirements
 
 - Windows with [Claude Code](https://claude.com/claude-code) logged in (the collector reads

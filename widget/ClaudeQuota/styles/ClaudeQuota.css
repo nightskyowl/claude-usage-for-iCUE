@@ -100,6 +100,19 @@ body {
   flex: 0 0 auto;
 }
 
+/* Age of the displayed figures. margin-right:auto pins it left while the
+   badges stay right-aligned in the flex-end top bar. tabular-nums keeps the
+   1 Hz digits from shifting the text width as they tick. */
+.freshness {
+  font-size: var(--font-badge);
+  opacity: 0.45;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  margin-right: auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .offline-banner {
   display: none;
   align-items: center;
@@ -192,6 +205,9 @@ body {
   font-size: var(--font-reset);
   opacity: 0.55;
   white-space: nowrap;
+  /* Countdown ticks once a second — proportional digits would visibly wobble
+     the line width, so pin to tabular figures. */
+  font-variant-numeric: tabular-nums;
 }
 
 /* Vertical Xeneon Edge slots (S/M/L/XL-V) share width ~696 — pin to the
