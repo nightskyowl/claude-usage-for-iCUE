@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>tr('Claude Quota')</title>
+  <link rel="icon" type="image/svg+xml" href="resources/icon.svg" />
+
+  <!-- Xeneon Edge only -->
+  <meta name="x-icue-restrictions" data-restrictions='[{ "device": "dashboard_lcd" }]' />
+
+  <!-- Feature Properties -->
+  <meta name="x-icue-property" content="serverPort" data-label="tr('Server Port')" data-type="textfield" data-default="'8765'" />
+
+  <!-- Widget Personalization (last group) -->
+  <meta name="x-icue-property" content="textColor" data-label="tr('Text Color')" data-type="color" data-default="'#FFFFFF'" />
+  <meta name="x-icue-property" content="accentColor" data-label="tr('Accent Color')" data-type="color" data-default="'#3ddc84'" />
+  <meta name="x-icue-property" content="backgroundColor" data-label="tr('Background Color')" data-type="color" data-default="'#000000'" />
+  <meta name="x-icue-property" content="transparency" data-label="tr('Background Transparency')" data-type="slider" data-default="100" data-min="0" data-max="100" data-step="1" data-unit-label="'%'" />
+
+  <script id="x-icue-groups" type="application/json">
+  [
+    { "title": "tr('Claude Quota')", "properties": ["serverPort"] },
+    { "title": "tr('Widget Personalization')", "properties": ["textColor", "accentColor", "backgroundColor", "transparency"] }
+  ]
+  </script>
+
+  <link rel="stylesheet" type="text/css" href="styles/ClaudeQuota.css" />
+</head>
+<body>
+  <div class="widget-root">
+    <div class="widget-background" aria-hidden="true">
+      <div class="main-glass"></div>
+    </div>
+
+    <div class="main-content">
+      <div class="loading-state">Loading&hellip;</div>
+
+      <div class="content">
+        <div class="top-bar">
+          <span class="stale-badge">Stale</span>
+          <span class="offline-banner">Collector offline</span>
+        </div>
+
+        <div class="rows">
+          <div class="quota-row" data-window="five_hour">
+            <div class="row-top">
+              <span class="row-label">5-Hour Window</span>
+              <span class="row-percent">--%</span>
+            </div>
+            <div class="bar-track"><div class="bar-fill"></div></div>
+            <div class="row-reset"></div>
+          </div>
+
+          <div class="quota-row" data-window="seven_day">
+            <div class="row-top">
+              <span class="row-label">Weekly Window</span>
+              <span class="row-percent">--%</span>
+            </div>
+            <div class="bar-track"><div class="bar-fill"></div></div>
+            <div class="row-reset"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // iCUE API binding — bare assignment is intentional (see references/lifecycle-and-plugins.md).
+    icueEvents = {
+      'onDataUpdated': onIcueDataUpdated,
+      'onICUEInitialized': onIcueInitialized
+    };
+
+    // Refresh cadence is a constant, not a user setting — localhost fetches are cheap.
+    var REFRESH_INTERVAL_MS = 60000;
+
+    var languageCode = 'en';
+    var currentPort = '8765';
+    var pollingStarted = false;
+    var firstFetchDone = false;
+    var lastGoodData = null; // { five_hour: {utilization, resets_at}, seven_day: {...} }
+    var isOffline = false;
+    var isStaleFlag = false;
+    var fetchTimer = null;
+    var resetsTemplate = 'Resets {value}';
+
+    // English fallback dictionary — used outside iCUE (plain browser preview)
+    // where the async tr() global is not injected. Mirrors translation.json's "en" block.
+    var TRANSLATIONS_EN = {
+      'Loading…': 'Loading…',
+      'Collector offline': 'Collector offline',
+      'Stale': 'Stale',
+      '5-Hour Window': '5-Hour Window',
+      'Weekly Window': 'Weekly Window',
+      'Resets {value}': 'Resets {value}'
+    };
+
+    function trText(key) {
+      if (typeof tr === 'function') {
+        try {
+          var result = tr(key);
+          if (result && typeof result.then === 'function') return result;
+          return Promise.resolve(result);
+        } catch (e) {
+          return Promise.resolve(TRANSLATIONS_EN[key] || key);
+        }
+      }
+      return Promise.resolve(TRANSLATIONS_EN[key] || key);
+    }
+
+    function getIcueProperty(name) {
+      if (typeof window !== 'undefined' && Object.prototype.hasOwnProperty.call(window, name)) {
+        var value = window[name];
+        if (value !== undefined && value !== null && value !== '') return value;
+      }
+      try {
+        var value2 = Function('return typeof ' + name + ' !== "undefined" ? ' + name + ' : undefined')();
+        if (value2 !== undefined && value2 !== null && value2 !== '') return value2;
+      } catch (e) {}
+      return undefined;
+    }
+
+    function clampRange(v, min, max, d) {
+      v = Number(v);
+      if (!Number.isFinite(v)) return d;
+      return Math.max(min, Math.min(max, v));
+    }
+
+    function clampPercent(v) {
+      var n = Number(v);
+      if (!Number.isFinite(n)) return null;
+      return Math.max(0, Math.min(100, n));
+    }
+
+    // --- Static translations (labels, states) — resolved once at startup ---
+    function initStaticText() {
+      Promise.all([
+        trText('Loading…'),
+        trText('Collector offline'),
+        trText('Stale'),
+        trText('5-Hour Window'),
+        trText('Weekly Window'),
+        trText('Resets {value}')
+      ]).then(function (vals) {
+        var loadingText = vals[0], offlineText = vals[1], staleText = vals[2],
+            fiveHourLabel = vals[3], weeklyLabel = vals[4], resetsTpl = vals[5];
+
+        resetsTemplate = resetsTpl || 'Resets {value}';
+
+        var loadingEl = document.querySelector('.loading-state');
+        if (loadingEl) loadingEl.textContent = loadingText;
+
+        var offlineEl = document.querySelector('.offline-banner');
+        if (offlineEl) offlineEl.textContent = offlineText;
+
+        var staleEl = document.querySelector('.stale-badge');
+        if (staleEl) staleEl.textContent = staleText;
+
+        var fiveHourLabelEl = document.querySelector('.quota-row[data-window="five_hour"] .row-label');
+        if (fiveHourLabelEl) fiveHourLabelEl.textContent = fiveHourLabel;
+
+        var weeklyLabelEl = document.querySelector('.quota-row[data-window="seven_day"] .row-label');
+        if (weeklyLabelEl) weeklyLabelEl.textContent = weeklyLabel;
+
+        // Re-render reset lines in case the template just resolved.
+        renderRows();
+      });
+    }
+
+    // --- Styles ---
+    function applyStyles() {
+      var root = document.documentElement;
+
+      var bgTransparency = clampRange(getIcueProperty('transparency'), 0, 100, 100) / 100;
+      root.style.setProperty('--bg-opacity', bgTransparency);
+
+      var tc = getIcueProperty('textColor');
+      var ac = getIcueProperty('accentColor');
+      var bgc = getIcueProperty('backgroundColor');
+      root.style.setProperty('--text-color', (typeof tc === 'string' && tc) ? tc : '#ffffff');
+      root.style.setProperty('--accent-color', (typeof ac === 'string' && ac) ? ac : '#3ddc84');
+      root.style.setProperty('--bg-color', (typeof bgc === 'string' && bgc) ? bgc : '#000000');
+    }
+
+    // --- State display ---
+    function showState(state) {
+      var loadingEl = document.querySelector('.loading-state');
+      var contentEl = document.querySelector('.content');
+      if (loadingEl) loadingEl.style.display = state === 'loading' ? '' : 'none';
+      if (contentEl) contentEl.style.display = state === 'content' ? 'flex' : 'none';
+    }
+
+    function setOffline(flag) {
+      isOffline = flag;
+      var contentEl = document.querySelector('.content');
+      if (!contentEl) return;
+      contentEl.classList.toggle('is-offline', flag);
+    }
+
+    function setStaleBadge(flag) {
+      isStaleFlag = flag;
+      var contentEl = document.querySelector('.content');
+      if (!contentEl) return;
+      contentEl.classList.toggle('is-stale', flag);
+    }
+
+    // --- Reset time formatting (local time via Intl.DateTimeFormat) ---
+    function formatResetLine(iso) {
+      if (!iso) return '';
+      var d = new Date(iso);
+      if (isNaN(d.getTime())) return '';
+      var now = new Date();
+      var sameDay = d.getFullYear() === now.getFullYear() &&
+                    d.getMonth() === now.getMonth() &&
+                    d.getDate() === now.getDate();
+      var timeStr = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit', hour12: false }).format(d);
+      var valueStr;
+      if (sameDay) {
+        valueStr = timeStr;
+      } else {
+        var weekday = new Intl.DateTimeFormat(undefined, { weekday: 'short' }).format(d);
+        valueStr = weekday + ' ' + timeStr;
+      }
+      return resetsTemplate.replace('{value}', valueStr);
+    }
+
+    // --- Bar color thresholds (fixed regardless of accentColor) ---
+    function fillColor(v) {
+      if (v === null) return 'rgba(255,255,255,0.12)';
+      if (v > 90) return '#ff4d4d';
+      if (v >= 70) return '#f5a623';
+      return '#3ddc84';
+    }
+
+    function renderWindow(selector, windowData) {
+      var row = document.querySelector('.quota-row[data-window="' + selector + '"]');
+      if (!row) return;
+      var percentEl = row.querySelector('.row-percent');
+      var fillEl = row.querySelector('.bar-fill');
+      var resetEl = row.querySelector('.row-reset');
+
+      var util = windowData && typeof windowData.utilization !== 'undefined' ? clampPercent(windowData.utilization) : null;
+      var resetsAt = windowData ? windowData.resets_at : null;
+
+      if (percentEl) percentEl.textContent = util === null ? '--%' : Math.round(util) + '%';
+      if (fillEl) {
+        fillEl.style.width = (util === null ? 0 : util) + '%';
+        fillEl.style.backgroundColor = fillColor(util);
+      }
+      if (resetEl) resetEl.textContent = formatResetLine(resetsAt);
+    }
+
+    function renderRows() {
+      var fiveHour = lastGoodData ? lastGoodData.five_hour : null;
+      var sevenDay = lastGoodData ? lastGoodData.seven_day : null;
+      renderWindow('five_hour', fiveHour);
+      renderWindow('seven_day', sevenDay);
+    }
+
+    // --- Data fetch: pure renderer — the ONLY network call this widget ever makes. ---
+    function fetchQuota() {
+      var port = getIcueProperty('serverPort');
+      port = (typeof port === 'string' && port.trim()) ? port.trim() : '8765';
+      var url = 'http://127.0.0.1:' + port + '/latest.json';
+
+      return fetch(url, { cache: 'no-store' })
+        .then(function (res) {
+          if (!res.ok) throw new Error('HTTP ' + res.status);
+          return res.json();
+        })
+        .then(function (data) {
+          setOffline(false);
+          if (data && typeof data === 'object') {
+            var hasWindows = data.five_hour || data.seven_day;
+            if (hasWindows) lastGoodData = data;
+            setStaleBadge(!!data.stale || data.ok === false);
+          }
+        })
+        .catch(function () {
+          setOffline(true);
+        })
+        .then(function () {
+          firstFetchDone = true;
+          showState('content');
+          renderRows();
+        });
+    }
+
+    function scheduleRefresh() {
+      if (fetchTimer) clearInterval(fetchTimer);
+      fetchTimer = setInterval(fetchQuota, REFRESH_INTERVAL_MS);
+    }
+
+    function startPolling() {
+      if (pollingStarted) return;
+      pollingStarted = true;
+      fetchQuota();
+      scheduleRefresh();
+    }
+
+    function onIcueDataUpdated() {
+      applyStyles();
+
+      var newPort = getIcueProperty('serverPort');
+      newPort = (typeof newPort === 'string' && newPort.trim()) ? newPort.trim() : '8765';
+      if (newPort !== currentPort) {
+        currentPort = newPort;
+        if (pollingStarted) fetchQuota();
+      }
+    }
+
+    function onIcueInitialized() {
+      if (typeof iCUE !== 'undefined' && iCUE.iCUELanguage) {
+        languageCode = iCUE.iCUELanguage;
+      }
+      onIcueDataUpdated();
+      startPolling();
+    }
+
+    // A single false read of iCUE_initialized is a race, not proof this is a browser.
+    var bootAttempts = 0, BOOT_RETRY_MS = 100, BOOT_RETRY_MAX = 15; // ~1.5s grace window
+    function bootCheck() {
+      if (typeof iCUE_initialized !== 'undefined' && iCUE_initialized) { onIcueInitialized(); return; }
+      if (bootAttempts < BOOT_RETRY_MAX) { bootAttempts++; setTimeout(bootCheck, BOOT_RETRY_MS); return; }
+      // Only now conclude this is really a plain browser — start rendering with defaults.
+      onIcueDataUpdated();
+      startPolling();
+    }
+
+    initStaticText();
+    applyStyles();
+    bootCheck();
+  </script>
+</body>
+</html>

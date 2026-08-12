@@ -1,0 +1,29 @@
+# --- Secrets: never commit credentials or tokens ---
+*.credentials*
+.credentials.json
+credentials.json
+*.token
+*.key
+.env
+.env.*
+
+# --- Runtime data (cached usage JSON may reveal account info) ---
+data/
+latest.json
+
+# --- Python ---
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# --- Node ---
+node_modules/
+
+# --- OS / editor ---
+Thumbs.db
+.DS_Store
+*.log
+
+# --- Local Claude session files ---
+.claude/

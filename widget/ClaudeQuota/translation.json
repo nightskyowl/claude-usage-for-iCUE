@@ -1,0 +1,19 @@
+{
+  "en": {
+    "translation": {
+      "Claude Quota": "Claude Quota",
+      "Server Port": "Server Port",
+      "Widget Personalization": "Widget Personalization",
+      "Text Color": "Text Color",
+      "Accent Color": "Accent Color",
+      "Background Color": "Background Color",
+      "Background Transparency": "Background Transparency",
+      "Loading…": "Loading…",
+      "Collector offline": "Collector offline",
+      "Stale": "Stale",
+      "5-Hour Window": "5-Hour Window",
+      "Weekly Window": "Weekly Window",
+      "Resets {value}": "Resets {value}"
+    }
+  }
+}

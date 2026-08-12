@@ -1,0 +1,224 @@
+:root {
+  --text-color: #ffffff;
+  --accent-color: #3ddc84;
+  --bg-color: #000000;
+  --bg-opacity: 1;
+
+  /* Sizing architecture — components consume semantic tokens only.
+     Media queries override the active baseline, not individual fonts. */
+  --layout-unit: 1vmin;
+  --device-vertical-s-unit: 4.16px; /* 416px / 100 — S-vertical canonical baseline */
+
+  --space-gap: calc(var(--layout-unit) * 5);
+  --space-pad-v: calc(var(--layout-unit) * 6);
+  --space-pad-h: calc(var(--layout-unit) * 8);
+  --radius-bar: calc(var(--layout-unit) * 2.5);
+  --radius-badge: calc(var(--layout-unit) * 2);
+
+  --font-percent: calc(var(--layout-unit) * 13);
+  --font-label: calc(var(--layout-unit) * 5);
+  --font-reset: calc(var(--layout-unit) * 3.6);
+  --font-badge: calc(var(--layout-unit) * 3);
+  --font-state: calc(var(--layout-unit) * 5);
+
+  --bar-height: calc(var(--layout-unit) * 5);
+}
+
+html { overflow: hidden; }
+
+body {
+  margin: 0;
+  padding: 0;
+  width: 100vw;
+  height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: OpenSans, Arial, sans-serif;
+  background: transparent;
+}
+
+.widget-root {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  color: var(--text-color);
+  box-sizing: border-box;
+  overflow: hidden;
+}
+
+.widget-background {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  opacity: var(--bg-opacity);
+  transition: opacity 0.2s ease;
+}
+
+.main-glass {
+  position: absolute;
+  inset: 0;
+  background-color: var(--bg-color);
+}
+
+.main-content {
+  position: relative;
+  z-index: 2;
+  box-sizing: border-box;
+  width: 100%;
+  height: 100%;
+  padding: var(--space-pad-v) var(--space-pad-h);
+  display: flex;
+  flex-direction: column;
+}
+
+/* Loading state */
+.loading-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  font-size: var(--font-state);
+  opacity: 0.7;
+}
+
+/* Content state */
+.content {
+  display: none;
+  flex-direction: column;
+  height: 100%;
+  width: 100%;
+  gap: calc(var(--layout-unit) * 2);
+}
+
+.top-bar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: calc(var(--layout-unit) * 2);
+  min-height: calc(var(--layout-unit) * 5);
+  flex: 0 0 auto;
+}
+
+.offline-banner {
+  display: none;
+  align-items: center;
+  gap: calc(var(--layout-unit) * 1.5);
+  font-size: var(--font-badge);
+  opacity: 0.9;
+  color: #ff9d9d;
+  white-space: nowrap;
+}
+.content.is-offline .offline-banner { display: flex; }
+
+.stale-badge {
+  display: none;
+  align-items: center;
+  font-size: var(--font-badge);
+  padding: calc(var(--layout-unit) * 0.8) calc(var(--layout-unit) * 2);
+  border-radius: var(--radius-badge);
+  background: rgba(255, 255, 255, 0.14);
+  opacity: 0.85;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.content.is-stale .stale-badge { display: inline-flex; }
+
+.rows {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-evenly;
+  flex: 1;
+  min-height: 0;
+  gap: var(--space-gap);
+}
+
+.quota-row {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: calc(var(--layout-unit) * 1.6);
+  min-width: 0;
+}
+
+.row-top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: calc(var(--layout-unit) * 3);
+}
+
+.row-label {
+  font-size: var(--font-label);
+  font-weight: 600;
+  color: var(--accent-color);
+  opacity: 0.9;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.row-percent {
+  font-size: var(--font-percent);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  white-space: nowrap;
+  color: var(--text-color);
+}
+
+.bar-track {
+  position: relative;
+  width: 100%;
+  height: var(--bar-height);
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: var(--radius-bar);
+  overflow: hidden;
+}
+
+.bar-fill {
+  position: absolute;
+  inset: 0;
+  width: 0%;
+  border-radius: var(--radius-bar);
+  background-color: rgba(255, 255, 255, 0.12);
+  transition: width 0.5s ease, background-color 0.5s ease;
+}
+
+.row-reset {
+  font-size: var(--font-reset);
+  opacity: 0.55;
+  white-space: nowrap;
+}
+
+/* Vertical Xeneon Edge slots (S/M/L/XL-V) share width ~696 — pin to the
+   S-vertical baseline per Rule 5 so M/L/XL vertical don't inflate typography;
+   extra height is absorbed by `.rows` justify-content: space-evenly instead. */
+@media (min-width: 680px) and (max-width: 712px) and (min-height: 416px) {
+  :root { --layout-unit: var(--device-vertical-s-unit); }
+}
+
+/* Wide landscape layouts (S-H, L-H, XL-H): side-by-side columns make better
+   use of the extra width than a tall stack. */
+@media (min-aspect-ratio: 1.9) {
+  .rows { flex-direction: row; align-items: stretch; }
+  .quota-row { flex: 1; }
+}
+
+/* S-H only (short + wide, 840x344): hide the reset line (Rule 6 — hide,
+   don't shrink) and tighten padding so the hero percentages stay uncramped. */
+@media (min-aspect-ratio: 2.2) and (max-height: 400px) {
+  .row-reset { display: none; }
+  .main-content { padding: calc(var(--layout-unit) * 5) calc(var(--layout-unit) * 7); }
+  .top-bar { min-height: calc(var(--layout-unit) * 4); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
