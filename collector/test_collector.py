@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Unit tests for claude_quota.py. Stdlib unittest only, no network access."""
 
+import io
 import json
 import os
 import sys
 import tempfile
 import threading
 import unittest
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -593,6 +595,162 @@ class TokenRefreshWriteBackTests(unittest.TestCase):
 
         with self.assertRaises(cq.FetchError) as ctx:
             cq.refresh_token_flow(self.creds_path)
+        self.assertIn("/login", str(ctx.exception))
+
+
+def _headers_lower(request):
+    """Normalize a urllib.request.Request's headers to a lowercase-keyed
+    dict, independent of urllib's internal capitalize() storage form."""
+    return {k.lower(): v for k, v in request.header_items()}
+
+
+class RefreshRequestBuildTests(unittest.TestCase):
+    """_build_refresh_request is the seam that lets us assert on headers
+    without touching the network. It must send the same User-Agent as the
+    usage GET (see UsageRequestHeadersTests) so Cloudflare's WAF in front of
+    console.anthropic.com doesn't block the request for looking like a bare
+    urllib client."""
+
+    def test_headers_include_user_agent_beta_accept_content_type(self):
+        request = cq._build_refresh_request("some-refresh-token")
+        headers = _headers_lower(request)
+        self.assertEqual(headers["user-agent"], cq.USER_AGENT)
+        self.assertEqual(headers["anthropic-beta"], "oauth-2025-04-20")
+        self.assertEqual(headers["accept"], "application/json")
+        self.assertEqual(headers["content-type"], "application/json")
+
+    def test_request_targets_token_url_via_post(self):
+        request = cq._build_refresh_request("some-refresh-token")
+        self.assertEqual(request.get_full_url(), cq.TOKEN_URL)
+        self.assertEqual(request.get_method(), "POST")
+
+    def test_body_contains_refresh_token_and_client_id(self):
+        request = cq._build_refresh_request("some-refresh-token")
+        body = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(body["grant_type"], "refresh_token")
+        self.assertEqual(body["refresh_token"], "some-refresh-token")
+        self.assertEqual(body["client_id"], cq.OAUTH_CLIENT_ID)
+
+
+class UsageRequestHeadersTests(unittest.TestCase):
+    """fetch_usage_payload's GET must use the same shared USER_AGENT
+    constant as the refresh POST."""
+
+    def setUp(self):
+        self._orig_urlopen = cq.urllib.request.urlopen
+        self.addCleanup(setattr, cq.urllib.request, "urlopen", self._orig_urlopen)
+
+    def test_usage_request_uses_shared_user_agent_and_beta_header(self):
+        captured = {}
+
+        class FakeResponse:
+            def __init__(self, body):
+                self._body = body
+
+            def getcode(self):
+                return 200
+
+            def read(self):
+                return self._body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc_info):
+                return False
+
+        def fake_urlopen(request, timeout=None):
+            captured["request"] = request
+            return FakeResponse(b'{"five_hour": {"utilization": 1}}')
+
+        cq.urllib.request.urlopen = fake_urlopen
+
+        cq.fetch_usage_payload("tok")
+
+        headers = _headers_lower(captured["request"])
+        self.assertEqual(headers["user-agent"], cq.USER_AGENT)
+        self.assertEqual(headers["anthropic-beta"], "oauth-2025-04-20")
+        self.assertEqual(headers["accept"], "application/json")
+        self.assertEqual(headers["authorization"], "Bearer tok")
+
+
+class RefreshFailureMessageMappingTests(unittest.TestCase):
+    """_refresh_failure_message maps HTTP status codes from the token
+    refresh endpoint to actionable, token-free messages."""
+
+    def test_400_says_refresh_token_invalid(self):
+        msg = cq._refresh_failure_message(400)
+        self.assertIn("HTTP 400", msg)
+        self.assertIn("refresh token is invalid", msg)
+        self.assertIn("/login", msg)
+
+    def test_401_says_refresh_token_invalid(self):
+        msg = cq._refresh_failure_message(401)
+        self.assertIn("HTTP 401", msg)
+        self.assertIn("refresh token is invalid", msg)
+        self.assertIn("/login", msg)
+
+    def test_403_says_blocked_by_server_no_login_suggestion(self):
+        msg = cq._refresh_failure_message(403)
+        self.assertIn("HTTP 403", msg)
+        self.assertIn("blocked", msg)
+        self.assertIn("rejected by server", msg)
+        # 403 means the server (e.g. WAF) rejected the request outright, not
+        # that the refresh token itself is bad, so don't tell the user to
+        # /login for this one.
+        self.assertNotIn("/login", msg)
+
+    def test_other_codes_keep_generic_message(self):
+        msg = cq._refresh_failure_message(500)
+        self.assertIn("HTTP 500", msg)
+        self.assertIn("/login", msg)
+
+
+class PostOauthRefreshHttpErrorTests(unittest.TestCase):
+    """post_oauth_refresh must translate HTTPError status codes through
+    _refresh_failure_message and always populate status_code."""
+
+    def setUp(self):
+        self._orig_urlopen = cq.urllib.request.urlopen
+        self.addCleanup(setattr, cq.urllib.request, "urlopen", self._orig_urlopen)
+
+    def _install_http_error(self, code):
+        def fake_urlopen(request, timeout=None):
+            raise urllib.error.HTTPError(cq.TOKEN_URL, code, "err", {}, io.BytesIO(b""))
+
+        cq.urllib.request.urlopen = fake_urlopen
+
+    def test_403_raises_blocked_message_with_status_code(self):
+        self._install_http_error(403)
+        with self.assertRaises(cq.FetchError) as ctx:
+            cq.post_oauth_refresh("some-refresh-token")
+        self.assertEqual(ctx.exception.status_code, 403)
+        self.assertIn("blocked", str(ctx.exception))
+        self.assertNotIn("some-refresh-token", str(ctx.exception))
+
+    def test_401_raises_rejected_message_with_status_code(self):
+        self._install_http_error(401)
+        with self.assertRaises(cq.FetchError) as ctx:
+            cq.post_oauth_refresh("some-refresh-token")
+        self.assertEqual(ctx.exception.status_code, 401)
+        self.assertIn("rejected", str(ctx.exception))
+        self.assertIn("/login", str(ctx.exception))
+        self.assertNotIn("some-refresh-token", str(ctx.exception))
+
+    def test_400_raises_rejected_message_with_status_code(self):
+        self._install_http_error(400)
+        with self.assertRaises(cq.FetchError) as ctx:
+            cq.post_oauth_refresh("some-refresh-token")
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("rejected", str(ctx.exception))
+        self.assertIn("/login", str(ctx.exception))
+
+    def test_500_raises_generic_message_with_status_code(self):
+        self._install_http_error(500)
+        with self.assertRaises(cq.FetchError) as ctx:
+            cq.post_oauth_refresh("some-refresh-token")
+        self.assertEqual(ctx.exception.status_code, 500)
+        self.assertIn("HTTP 500", str(ctx.exception))
         self.assertIn("/login", str(ctx.exception))
 
 

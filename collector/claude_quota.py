@@ -88,6 +88,12 @@ TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
 OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"  # Claude Code's public PKCE client id
 HTTP_TIMEOUT_SECONDS = 30
 
+# Shared User-Agent for every outbound request to Anthropic. Without a
+# realistic UA, urllib falls back to "Python-urllib/3.x", which Cloudflare's
+# WAF in front of console.anthropic.com blocks with a 403 -- even for
+# otherwise well-formed requests.
+USER_AGENT = "claude-quota-widget/1.0"
+
 # Disables all OAuth token-refresh behavior (both the proactive pre-expiry
 # refresh and the on-401 refresh+retry) when set to "1"/"true". Escape hatch
 # for debugging or environments where the credentials file is managed
@@ -297,7 +303,7 @@ def fetch_usage_payload(token: str) -> Any:
             "Authorization": f"Bearer {token}",
             "anthropic-beta": "oauth-2025-04-20",
             "Accept": "application/json",
-            "User-Agent": "claude-quota-widget/1.0",
+            "User-Agent": USER_AGENT,
         },
         method="GET",
     )
@@ -328,13 +334,10 @@ def fetch_usage_payload(token: str) -> Any:
 _TOKEN_REFRESH_ERROR_SUFFIX = "open Claude Code and run /login"
 
 
-def post_oauth_refresh(refresh_token: str) -> dict:
-    """Perform the raw HTTP POST to TOKEN_URL and return the parsed JSON body.
-
-    Isolated as its own function (mirroring fetch_usage_payload) so tests can
-    monkeypatch it without touching urllib/network. Never includes the token
-    in any raised error message.
-    """
+def _build_refresh_request(refresh_token: str) -> urllib.request.Request:
+    """Build (without sending) the urllib Request for the OAuth token refresh
+    POST. Isolated so tests can inspect headers/body without touching the
+    network."""
     body = json.dumps(
         {
             "grant_type": "refresh_token",
@@ -342,21 +345,46 @@ def post_oauth_refresh(refresh_token: str) -> dict:
             "client_id": OAUTH_CLIENT_ID,
         }
     ).encode("utf-8")
-    request = urllib.request.Request(
+    return urllib.request.Request(
         TOKEN_URL,
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": USER_AGENT,
+            "anthropic-beta": "oauth-2025-04-20",
+        },
         method="POST",
     )
+
+
+def _refresh_failure_message(status_code: int) -> str:
+    """Map an HTTP status code from the token refresh endpoint to an
+    actionable, token-free error message."""
+    if status_code in (400, 401):
+        return (
+            f"token refresh rejected (HTTP {status_code}) — refresh token is "
+            f"invalid; {_TOKEN_REFRESH_ERROR_SUFFIX}"
+        )
+    if status_code == 403:
+        return "token refresh blocked (HTTP 403) — request rejected by server"
+    return f"token refresh failed (HTTP {status_code}) — {_TOKEN_REFRESH_ERROR_SUFFIX}"
+
+
+def post_oauth_refresh(refresh_token: str) -> dict:
+    """Perform the raw HTTP POST to TOKEN_URL and return the parsed JSON body.
+
+    Isolated as its own function (mirroring fetch_usage_payload) so tests can
+    monkeypatch it without touching urllib/network. Never includes the token
+    in any raised error message.
+    """
+    request = _build_refresh_request(refresh_token)
     try:
         with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
             status = response.getcode()
             resp_body = response.read()
     except urllib.error.HTTPError as exc:
-        raise FetchError(
-            f"token refresh failed (HTTP {exc.code}) — {_TOKEN_REFRESH_ERROR_SUFFIX}",
-            status_code=exc.code,
-        )
+        raise FetchError(_refresh_failure_message(exc.code), status_code=exc.code)
     except urllib.error.URLError as exc:
         raise FetchError(
             f"token refresh failed (network error: {exc.reason.__class__.__name__}) — "
@@ -366,10 +394,7 @@ def post_oauth_refresh(refresh_token: str) -> dict:
         raise FetchError(f"token refresh failed (timed out) — {_TOKEN_REFRESH_ERROR_SUFFIX}")
 
     if status != 200:
-        raise FetchError(
-            f"token refresh failed (HTTP {status}) — {_TOKEN_REFRESH_ERROR_SUFFIX}",
-            status_code=status,
-        )
+        raise FetchError(_refresh_failure_message(status), status_code=status)
 
     try:
         parsed = json.loads(resp_body.decode("utf-8"))
