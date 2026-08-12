@@ -16,6 +16,68 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import claude_quota as cq
 
+# --------------------------------------------------------------------------
+# Real-collector.log safety net
+# --------------------------------------------------------------------------
+#
+# claude_quota.log ("claude_quota" logger) propagates to the root logger,
+# which logging.basicConfig() (run at import time by claude_quota) attaches a
+# StreamHandler to. Nothing here writes to a *file* unless something calls
+# claude_quota._configure_file_logging() (directly, or indirectly via
+# claude_quota.main()) -- that attaches a FileHandler pointed at
+# claude_quota.LOG_PATH to the root logger. If any test does that without
+# first repointing LOG_PATH at a temp file, every log line emitted by *any*
+# later test in the run (fixture warnings, "token refresh succeeded" from
+# monkeypatched refresh flows, "poll ok"/"poll failed" from poll-cycle tests,
+# etc.) leaks into the real collector.log used by the live collector process.
+#
+# Individual test classes that exercise file logging (LogFileTruncationTests,
+# DiagCliInvocationTests) patch LOG_PATH locally and detach any handler they
+# attach. setUpModule/tearDownModule below is a belt-and-suspenders guard on
+# top of that: it repoints LOG_PATH at a per-run temp file for the *entire*
+# test session, and asserts no FileHandler targeting the real collector.log
+# is ever attached to the root logger.
+
+_REAL_LOG_PATH = cq.LOG_PATH.resolve()
+_module_tmp_log_dir = None
+
+
+def _real_log_file_handler_attached():
+    """Return the first root-logger FileHandler whose target file resolves
+    to the real collector.log, or None."""
+    for handler in cq.logging.getLogger().handlers:
+        if isinstance(handler, cq.logging.FileHandler):
+            try:
+                base = Path(handler.baseFilename).resolve()
+            except OSError:
+                continue
+            if base == _REAL_LOG_PATH:
+                return handler
+    return None
+
+
+def _assert_real_log_untouched():
+    leaked = _real_log_file_handler_attached()
+    assert leaked is None, (
+        f"a FileHandler targeting the real collector.log ({_REAL_LOG_PATH}) "
+        f"is attached to the root logger: {leaked!r} -- this would leak "
+        f"test log lines into the live collector's log file"
+    )
+
+
+def setUpModule():
+    global _module_tmp_log_dir
+    _assert_real_log_untouched()
+    _module_tmp_log_dir = tempfile.TemporaryDirectory(prefix="claude-quota-test-log-")
+    cq.LOG_PATH = Path(_module_tmp_log_dir.name) / "collector.log"
+
+
+def tearDownModule():
+    cq.LOG_PATH = _REAL_LOG_PATH
+    _assert_real_log_untouched()
+    if _module_tmp_log_dir is not None:
+        _module_tmp_log_dir.cleanup()
+
 
 class NormalizeUtilizationTests(unittest.TestCase):
     """Rule under test (see cq.normalize_utilization docstring): raw values are
@@ -1107,6 +1169,31 @@ class DiagCliInvocationTests(unittest.TestCase):
             raise AssertionError("--diag must never start the HTTP server")
 
         cq.make_server = _must_not_be_called_server
+
+        # cq.main() calls _configure_file_logging() unconditionally (even in
+        # --diag mode), which attaches a FileHandler to the root logger
+        # pointed at cq.LOG_PATH. Point it at a temp file and detach
+        # whatever handler(s) get attached afterward, so this test can never
+        # leak log lines into the real collector.log for the rest of the run.
+        self._orig_log_path = cq.LOG_PATH
+        self.log_path = Path(self.tmpdir.name) / "collector.log"
+        cq.LOG_PATH = self.log_path
+        self.addCleanup(setattr, cq, "LOG_PATH", self._orig_log_path)
+
+        self._root_logger = cq.logging.getLogger()
+        self._orig_handlers = list(self._root_logger.handlers)
+        self.addCleanup(self._detach_new_handlers)
+
+    def _detach_new_handlers(self):
+        leaked = _real_log_file_handler_attached()
+        for handler in list(self._root_logger.handlers):
+            if handler not in self._orig_handlers:
+                self._root_logger.removeHandler(handler)
+                handler.close()
+        assert leaked is None, (
+            f"test_main_with_diag_flag_writes_file_and_returns attached a "
+            f"FileHandler targeting the real collector.log: {leaked!r}"
+        )
 
     def test_main_with_diag_flag_writes_file_and_returns(self):
         sys.argv = ["claude_quota.py", "--diag"]
