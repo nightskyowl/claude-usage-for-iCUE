@@ -880,5 +880,323 @@ class PollSecondsFloorTests(unittest.TestCase):
             del os.environ["CLAUDE_QUOTA_POLL_SECONDS"]
 
 
+class DescribeCredentialsTests(unittest.TestCase):
+    """describe_credentials() must summarize credential state without ever
+    including token text/prefix/fragment."""
+
+    def test_present_access_absent_refresh_expired(self):
+        token = "a" * 108
+        expires_at_ms = int(cq.time.time() * 1000) - 5000  # already expired
+        data = {
+            "claudeAiOauth": {
+                "accessToken": token,
+                "expiresAt": expires_at_ms,
+            }
+        }
+        summary = cq.describe_credentials(data)
+
+        self.assertIn("access_token=present(len=108)", summary)
+        self.assertIn("refresh_token=absent", summary)
+        self.assertIn("(expired)", summary)
+        self.assertNotIn(token, summary)
+
+    def test_present_refresh_and_valid_expiry(self):
+        access = "b" * 40
+        refresh = "c" * 64
+        expires_at_ms = int(cq.time.time() * 1000) + 3_600_000  # 1h in future
+        data = {
+            "claudeAiOauth": {
+                "accessToken": access,
+                "refreshToken": refresh,
+                "expiresAt": expires_at_ms,
+            }
+        }
+        summary = cq.describe_credentials(data)
+
+        self.assertIn("access_token=present(len=40)", summary)
+        self.assertIn("refresh_token=present(len=64)", summary)
+        self.assertIn("(valid)", summary)
+        self.assertNotIn(access, summary)
+        self.assertNotIn(refresh, summary)
+
+    def test_no_tokens_no_expiry(self):
+        summary = cq.describe_credentials({"claudeAiOauth": {}})
+        self.assertIn("access_token=absent", summary)
+        self.assertIn("refresh_token=absent", summary)
+        self.assertIn("expires_at=unknown", summary)
+
+    def test_missing_oauth_block_does_not_crash(self):
+        summary = cq.describe_credentials({"somethingElse": True})
+        self.assertIn("access_token=absent", summary)
+        self.assertIn("refresh_token=absent", summary)
+
+    def test_never_leaks_token_text_for_secret_like_values(self):
+        secret = "sk-ant-oat01-super-secret-fragment-should-never-appear"
+        data = {"claudeAiOauth": {"accessToken": secret, "refreshToken": secret}}
+        summary = cq.describe_credentials(data)
+        self.assertNotIn(secret, summary)
+        self.assertNotIn(secret[:10], summary)
+
+
+class DiagModeTests(unittest.TestCase):
+    """Coverage for build_diag() / run_diag() (the --diag mode): structure,
+    sanitization, and that it never touches the network."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.creds_path = Path(self.tmpdir.name) / ".credentials.json"
+        self.diag_path = Path(self.tmpdir.name) / "diag.json"
+
+        self._orig_creds = cq.CREDENTIALS_PATH
+        self.addCleanup(setattr, cq, "CREDENTIALS_PATH", self._orig_creds)
+        cq.CREDENTIALS_PATH = self.creds_path
+
+        self._orig_diag = cq.DIAG_PATH
+        self.addCleanup(setattr, cq, "DIAG_PATH", self._orig_diag)
+        cq.DIAG_PATH = self.diag_path
+
+        # The usage endpoint must never be called in --diag mode: fail loudly
+        # if anything tries.
+        self._orig_fetch = cq.fetch_usage_payload
+        self.addCleanup(setattr, cq, "fetch_usage_payload", self._orig_fetch)
+
+        def _must_not_be_called(token):
+            raise AssertionError("fetch_usage_payload must not be called in --diag mode")
+
+        cq.fetch_usage_payload = _must_not_be_called
+
+    def _write_creds(self, oauth):
+        self.creds_path.write_text(json.dumps({"claudeAiOauth": oauth}), encoding="utf-8")
+
+    def test_diag_structure_with_fixture_creds(self):
+        access = "z" * 108
+        refresh = "y" * 55
+        expires_at_ms = int(cq.time.time() * 1000) - 1000  # expired
+        self._write_creds(
+            {
+                "accessToken": access,
+                "refreshToken": refresh,
+                "expiresAt": expires_at_ms,
+                "scopes": ["user:inference"],
+                "subscriptionType": "pro",
+            }
+        )
+
+        diag = cq.build_diag()
+        dumped = json.dumps(diag)
+
+        # top-level shape
+        for key in (
+            "generated_at",
+            "python_version",
+            "platform",
+            "credentials_file",
+            "credential_manager",
+        ):
+            self.assertIn(key, diag)
+
+        creds_section = diag["credentials_file"]
+        self.assertEqual(creds_section["path"], str(self.creds_path))
+        self.assertTrue(creds_section["exists"])
+        self.assertIsNotNone(creds_section["mtime"])
+        self.assertIn("claudeAiOauth", creds_section["top_level_keys"])
+        self.assertIn("accessToken", creds_section["oauth_keys"])
+        self.assertIn("refreshToken", creds_section["oauth_keys"])
+        self.assertTrue(creds_section["access_token_present"])
+        self.assertEqual(creds_section["access_token_length"], 108)
+        self.assertTrue(creds_section["refresh_token_present"])
+        self.assertEqual(creds_section["refresh_token_length"], 55)
+        self.assertTrue(creds_section["expired"])
+        self.assertIsNotNone(creds_section["expires_at_iso"])
+        self.assertEqual(creds_section["scopes"], ["user:inference"])
+        self.assertEqual(creds_section["subscription_type"], "pro")
+
+        cred_mgr = diag["credential_manager"]
+        self.assertIn("available", cred_mgr)
+        self.assertIn("claude_targets", cred_mgr)
+        if sys.platform != "win32":
+            self.assertFalse(cred_mgr["available"])
+            self.assertEqual(cred_mgr["claude_targets"], [])
+
+        # sanitization: no token text anywhere in the serialized diag
+        self.assertNotIn(access, dumped)
+        self.assertNotIn(refresh, dumped)
+
+    def test_diag_handles_missing_credentials_file(self):
+        # self.creds_path deliberately not written
+        diag = cq.build_diag()
+        creds_section = diag["credentials_file"]
+        self.assertFalse(creds_section["exists"])
+        self.assertIsNone(creds_section["mtime"])
+        self.assertEqual(creds_section["top_level_keys"], [])
+        self.assertFalse(creds_section["access_token_present"])
+        self.assertFalse(creds_section["refresh_token_present"])
+
+    def test_diag_handles_missing_refresh_token(self):
+        self._write_creds({"accessToken": "a" * 20})
+        diag = cq.build_diag()
+        creds_section = diag["credentials_file"]
+        self.assertTrue(creds_section["access_token_present"])
+        self.assertFalse(creds_section["refresh_token_present"])
+        self.assertEqual(creds_section["refresh_token_length"], 0)
+
+    def test_run_diag_writes_file_and_never_calls_usage_endpoint(self):
+        self._write_creds({"accessToken": "a" * 20, "refreshToken": "b" * 20})
+        cq.run_diag()
+
+        self.assertTrue(self.diag_path.exists())
+        on_disk = json.loads(self.diag_path.read_text(encoding="utf-8"))
+        self.assertIn("credentials_file", on_disk)
+        self.assertIn("credential_manager", on_disk)
+        self.assertNotIn("a" * 20, json.dumps(on_disk))
+
+    def test_credential_manager_available_false_on_non_windows(self):
+        if sys.platform == "win32":
+            self.skipTest("this assertion targets non-Windows behavior")
+        result = cq._diag_credential_manager()
+        self.assertEqual(result, {"available": False, "claude_targets": []})
+
+
+class DiagCliInvocationTests(unittest.TestCase):
+    """--diag via sys.argv must not start the server/poller and must exit
+    cleanly after writing DIAG_PATH."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.creds_path = Path(self.tmpdir.name) / ".credentials.json"
+        self.creds_path.write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "a" * 20}}), encoding="utf-8"
+        )
+        self.diag_path = Path(self.tmpdir.name) / "diag.json"
+
+        self._orig_creds = cq.CREDENTIALS_PATH
+        self.addCleanup(setattr, cq, "CREDENTIALS_PATH", self._orig_creds)
+        cq.CREDENTIALS_PATH = self.creds_path
+
+        self._orig_diag = cq.DIAG_PATH
+        self.addCleanup(setattr, cq, "DIAG_PATH", self._orig_diag)
+        cq.DIAG_PATH = self.diag_path
+
+        self._orig_argv = sys.argv
+        self.addCleanup(setattr, sys, "argv", self._orig_argv)
+
+        self._orig_fetch = cq.fetch_usage_payload
+        self.addCleanup(setattr, cq, "fetch_usage_payload", self._orig_fetch)
+
+        def _must_not_be_called(token):
+            raise AssertionError("--diag must never call the usage endpoint")
+
+        cq.fetch_usage_payload = _must_not_be_called
+
+        self._orig_make_server = cq.make_server
+        self.addCleanup(setattr, cq, "make_server", self._orig_make_server)
+
+        def _must_not_be_called_server(port=None):
+            raise AssertionError("--diag must never start the HTTP server")
+
+        cq.make_server = _must_not_be_called_server
+
+    def test_main_with_diag_flag_writes_file_and_returns(self):
+        sys.argv = ["claude_quota.py", "--diag"]
+        cq.main()  # must return normally (i.e. exit 0), not start server/poller
+        self.assertTrue(self.diag_path.exists())
+
+
+class RateLimit429Tests(unittest.TestCase):
+    """On HTTP 429 from the usage endpoint: no refresh attempted, no retry
+    this cycle, and the specific friendly error message is used."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.data_path = Path(self.tmpdir.name) / "latest.json"
+        self.creds_path = Path(self.tmpdir.name) / ".credentials.json"
+        self.creds_path.write_text(
+            json.dumps(
+                {
+                    "claudeAiOauth": {
+                        "accessToken": "fake-token-xyz",
+                        "refreshToken": "old-refresh",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        self._orig_creds = cq.CREDENTIALS_PATH
+        cq.CREDENTIALS_PATH = self.creds_path
+        self.addCleanup(setattr, cq, "CREDENTIALS_PATH", self._orig_creds)
+
+        self._orig_fetch = cq.fetch_usage_payload
+        self.addCleanup(setattr, cq, "fetch_usage_payload", self._orig_fetch)
+
+        self._orig_post_refresh = cq.post_oauth_refresh
+        self.addCleanup(setattr, cq, "post_oauth_refresh", self._orig_post_refresh)
+
+        self._orig_no_refresh = cq.NO_REFRESH
+        cq.NO_REFRESH = False
+        self.addCleanup(setattr, cq, "NO_REFRESH", self._orig_no_refresh)
+
+    def test_429_no_refresh_no_retry_exact_message(self):
+        refresh_called = []
+        cq.post_oauth_refresh = lambda rt: refresh_called.append(rt) or {
+            "access_token": "should-not-be-used"
+        }
+
+        calls = []
+
+        def fake_fetch(token):
+            calls.append(token)
+            raise cq.FetchError("HTTP 429", status_code=429)
+
+        cq.fetch_usage_payload = fake_fetch
+
+        result = cq.poll_once(self.data_path)
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["stale"])
+        self.assertEqual(
+            result["error"],
+            "HTTP 429 — rate limited by Anthropic; will retry next cycle "
+            "(avoid restarting repeatedly)",
+        )
+        # exactly one usage call: no retry this cycle
+        self.assertEqual(len(calls), 1)
+        # no refresh attempted: 429 is not an auth failure
+        self.assertEqual(refresh_called, [])
+
+    def test_429_does_not_trigger_auth_failure_creds_log_line(self):
+        cq.post_oauth_refresh = lambda rt: {"access_token": "should-not-be-used"}
+
+        def fake_fetch(token):
+            raise cq.FetchError("HTTP 429", status_code=429)
+
+        cq.fetch_usage_payload = fake_fetch
+
+        with self.assertLogs(cq.log, level="INFO") as ctx:
+            cq.poll_once(self.data_path)
+
+        self.assertFalse(any("creds state" in line for line in ctx.output))
+
+    def test_401_still_logs_sanitized_creds_state_line(self):
+        cq.NO_REFRESH = True
+
+        def fake_fetch(token):
+            raise cq.FetchError("HTTP 401", status_code=401)
+
+        cq.fetch_usage_payload = fake_fetch
+
+        with self.assertLogs(cq.log, level="INFO") as ctx:
+            result = cq.poll_once(self.data_path)
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("creds state:" in line for line in ctx.output))
+        self.assertTrue(any("access_token=present" in line for line in ctx.output))
+        self.assertNotIn("fake-token-xyz", "\n".join(ctx.output))
+        self.assertNotIn("old-refresh", "\n".join(ctx.output))
+
+
 if __name__ == "__main__":
     unittest.main()

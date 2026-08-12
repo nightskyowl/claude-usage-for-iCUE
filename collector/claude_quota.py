@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import platform
 import signal
 import sys
 import tempfile
@@ -78,6 +79,12 @@ CREDENTIALS_PATH = Path(
 ).expanduser()
 DATA_PATH = Path(
     os.environ.get("CLAUDE_QUOTA_DATA", str(SCRIPT_DIR / ".." / "data" / "latest.json"))
+).expanduser()
+# Same data-directory resolution as DATA_PATH (i.e. same folder as latest.json)
+# so --diag writes alongside the normal data file. Overridable independently
+# for tests via CLAUDE_QUOTA_DIAG.
+DIAG_PATH = Path(
+    os.environ.get("CLAUDE_QUOTA_DIAG", str(DATA_PATH.with_name("diag.json")))
 ).expanduser()
 LOG_PATH = Path(
     os.environ.get("CLAUDE_QUOTA_LOG", str(SCRIPT_DIR / "collector.log"))
@@ -291,6 +298,77 @@ def read_access_token(path: Path) -> str:
     return _extract_access_token(data)
 
 
+def _credential_state_fields(data: Any) -> dict:
+    """Extract sanitized (no token text/prefix/fragment) fields describing
+    OAuth credential state from a parsed credentials JSON object. Shared by
+    describe_credentials() (one-line log summary) and the --diag JSON writer
+    so the sanitization/parsing logic lives in exactly one place."""
+    oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
+    if not isinstance(oauth, dict):
+        oauth = {}
+
+    access_token = oauth.get("accessToken")
+    refresh_token = oauth.get("refreshToken")
+    access_present = isinstance(access_token, str) and bool(access_token)
+    refresh_present = isinstance(refresh_token, str) and bool(refresh_token)
+    access_len = len(access_token) if isinstance(access_token, str) else 0
+    refresh_len = len(refresh_token) if isinstance(refresh_token, str) else 0
+
+    expires_at = oauth.get("expiresAt")
+    expires_at_iso: Optional[str] = None
+    expired: Optional[bool] = None
+    if isinstance(expires_at, (int, float)) and not isinstance(expires_at, bool):
+        try:
+            expires_at_iso = datetime.fromtimestamp(
+                expires_at / 1000.0, tz=timezone.utc
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        except (OverflowError, OSError, ValueError):
+            expires_at_iso = None
+        expired = (time.time() * 1000) > expires_at
+
+    return {
+        "access_token_present": access_present,
+        "access_token_length": access_len,
+        "refresh_token_present": refresh_present,
+        "refresh_token_length": refresh_len,
+        "expires_at_iso": expires_at_iso,
+        "expired": expired,
+    }
+
+
+def describe_credentials(data: Any) -> str:
+    """Build a one-line, token-free summary of credential state suitable for
+    logging on auth failures, e.g.:
+
+        creds state: access_token=present(len=108) refresh_token=absent
+        expires_at=2026-08-11T21:03:11Z(expired)
+
+    Never includes any token text, prefix, or fragment.
+    """
+    fields = _credential_state_fields(data)
+
+    if fields["access_token_present"]:
+        access_desc = f"present(len={fields['access_token_length']})"
+    else:
+        access_desc = "absent"
+
+    if fields["refresh_token_present"]:
+        refresh_desc = f"present(len={fields['refresh_token_length']})"
+    else:
+        refresh_desc = "absent"
+
+    if fields["expires_at_iso"]:
+        expired_desc = "expired" if fields["expired"] else "valid"
+        expires_desc = f"{fields['expires_at_iso']}({expired_desc})"
+    else:
+        expires_desc = "unknown"
+
+    return (
+        f"creds state: access_token={access_desc} refresh_token={refresh_desc} "
+        f"expires_at={expires_desc}"
+    )
+
+
 def fetch_usage_payload(token: str) -> Any:
     """Perform the actual HTTP GET and return the parsed JSON body.
 
@@ -502,6 +580,15 @@ def fetch_and_normalize() -> dict:
     try:
         payload = fetch_usage_payload(token)
     except FetchError as exc:
+        if exc.status_code == 429:
+            # Not an auth failure: never attempt a token refresh or a retry
+            # this cycle -- refreshing/retrying on 429 would only make the
+            # rate limiting worse.
+            raise FetchError(
+                "HTTP 429 — rate limited by Anthropic; will retry next cycle "
+                "(avoid restarting repeatedly)",
+                status_code=429,
+            )
         if exc.status_code == 401:
             if NO_REFRESH:
                 raise FetchError(
@@ -592,6 +679,16 @@ def write_failure(path: Path, error: str) -> dict:
 # --------------------------------------------------------------------------
 
 
+def _is_auth_failure(exc: FetchError) -> bool:
+    """True if this failure is a 401 or an OAuth token-refresh failure (as
+    opposed to e.g. a network error or a 429), which is when the sanitized
+    credential-state log line is useful for diagnosing."""
+    if exc.status_code == 401:
+        return True
+    message = str(exc)
+    return "401" in message or "token refresh" in message
+
+
 def poll_once(path: Path = None) -> dict:
     """Run a single poll cycle: fetch, normalize, write, log. Returns the
     data that was written."""
@@ -606,6 +703,13 @@ def poll_once(path: Path = None) -> dict:
             _fmt_util(result.get("five_hour")),
             _fmt_util(result.get("seven_day")),
         )
+        if _is_auth_failure(exc):
+            try:
+                creds_data = read_credentials(CREDENTIALS_PATH)
+            except FetchError:
+                pass
+            else:
+                log.info(describe_credentials(creds_data))
         return result
     except Exception as exc:  # noqa: BLE001 - never crash the poller
         result = write_failure(path, f"unexpected error ({exc.__class__.__name__})")
@@ -685,6 +789,166 @@ def make_server(port: int = None) -> ThreadingHTTPServer:
 
 
 # --------------------------------------------------------------------------
+# Diagnostics (--diag)
+# --------------------------------------------------------------------------
+
+
+def _diag_credential_manager() -> dict:
+    """Scan Windows Credential Manager for generic credentials whose target
+    name contains "claude" (case-insensitive). Collects TARGET NAMES ONLY --
+    never reads/decrypts a credential blob. Returns {"available": False,
+    "claude_targets": []} on any failure or on non-Windows platforms."""
+    result: dict = {"available": False, "claude_targets": []}
+    if sys.platform != "win32":
+        return result
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+
+        CRED_TYPE_GENERIC = 1
+
+        class CREDENTIAL(ctypes.Structure):
+            _fields_ = [
+                ("Flags", wintypes.DWORD),
+                ("Type", wintypes.DWORD),
+                ("TargetName", wintypes.LPWSTR),
+                ("Comment", wintypes.LPWSTR),
+                ("LastWritten", wintypes.FILETIME),
+                ("CredentialBlobSize", wintypes.DWORD),
+                ("CredentialBlob", ctypes.POINTER(ctypes.c_byte)),
+                ("Persist", wintypes.DWORD),
+                ("AttributeCount", wintypes.DWORD),
+                ("Attributes", ctypes.c_void_p),
+                ("TargetAlias", wintypes.LPWSTR),
+                ("UserName", wintypes.LPWSTR),
+            ]
+
+        PCREDENTIAL = ctypes.POINTER(CREDENTIAL)
+
+        advapi32.CredEnumerateW.restype = wintypes.BOOL
+        advapi32.CredEnumerateW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+            ctypes.POINTER(ctypes.POINTER(PCREDENTIAL)),
+        ]
+        advapi32.CredFree.restype = None
+        advapi32.CredFree.argtypes = [ctypes.c_void_p]
+
+        count = wintypes.DWORD()
+        creds_ptr_ptr = ctypes.POINTER(PCREDENTIAL)()
+
+        ok = advapi32.CredEnumerateW(
+            None, 0, ctypes.byref(count), ctypes.byref(creds_ptr_ptr)
+        )
+        if not ok:
+            # e.g. ERROR_NOT_FOUND when there are no stored credentials at
+            # all -- treat as a successful (empty) scan, not an error.
+            last_err = ctypes.get_last_error()
+            if last_err == 1168:  # ERROR_NOT_FOUND
+                result["available"] = True
+            return result
+
+        targets = []
+        try:
+            for i in range(count.value):
+                cred = creds_ptr_ptr[i].contents
+                if cred.Type != CRED_TYPE_GENERIC:
+                    continue
+                name = cred.TargetName
+                if name and "claude" in name.lower():
+                    targets.append(name)
+        finally:
+            advapi32.CredFree(creds_ptr_ptr)
+
+        result["available"] = True
+        result["claude_targets"] = targets
+        return result
+    except Exception:  # noqa: BLE001 - diagnostics must never crash
+        return {"available": False, "claude_targets": []}
+
+
+def _diag_credentials_file(creds_path: Path) -> dict:
+    """Build the sanitized "credentials_file" section of diag.json. Never
+    reads/includes any token text, prefix, or fragment."""
+    info: dict = {
+        "path": str(creds_path),
+        "exists": False,
+        "mtime": None,
+        "top_level_keys": [],
+        "oauth_keys": [],
+        "access_token_present": False,
+        "access_token_length": 0,
+        "refresh_token_present": False,
+        "refresh_token_length": 0,
+        "expires_at_iso": None,
+        "expired": None,
+        "scopes": None,
+        "subscription_type": None,
+    }
+
+    try:
+        exists = creds_path.exists()
+    except OSError:
+        exists = False
+    info["exists"] = exists
+    if not exists:
+        return info
+
+    try:
+        stat = creds_path.stat()
+        info["mtime"] = datetime.fromtimestamp(
+            stat.st_mtime, tz=timezone.utc
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except OSError:
+        info["mtime"] = None
+
+    try:
+        data = read_credentials(creds_path)
+    except FetchError:
+        return info
+
+    if isinstance(data, dict):
+        info["top_level_keys"] = sorted(data.keys())
+        oauth = data.get("claudeAiOauth")
+        if isinstance(oauth, dict):
+            info["oauth_keys"] = sorted(oauth.keys())
+            if "scopes" in oauth:
+                info["scopes"] = oauth.get("scopes")
+            if "subscriptionType" in oauth:
+                info["subscription_type"] = oauth.get("subscriptionType")
+        info.update(_credential_state_fields(data))
+
+    return info
+
+
+def build_diag(creds_path: Path = None) -> dict:
+    """Build the full sanitized --diag payload. Does not touch the network
+    (no usage-endpoint call) and never includes any token text."""
+    creds_path = creds_path if creds_path is not None else CREDENTIALS_PATH
+    return {
+        "generated_at": _utc_now_iso(),
+        "python_version": platform.python_version(),
+        "platform": sys.platform,
+        "credentials_file": _diag_credentials_file(creds_path),
+        "credential_manager": _diag_credential_manager(),
+    }
+
+
+def run_diag() -> None:
+    """Entry point for `python claude_quota.py --diag`: writes DIAG_PATH and
+    returns (caller exits 0). Never starts the server or calls the usage
+    endpoint."""
+    diag = build_diag()
+    _atomic_write_json(DIAG_PATH, diag)
+    log.info("diag written to %s", DIAG_PATH)
+    print(f"diag written to {DIAG_PATH}")
+
+
+# --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
 
@@ -713,6 +977,13 @@ def _configure_file_logging() -> None:
 
 
 def main() -> None:
+    if "--diag" in sys.argv[1:]:
+        # Diagnostic mode: must not start the server and must not call the
+        # (rate-limited) usage endpoint.
+        _configure_file_logging()
+        run_diag()
+        return
+
     _configure_file_logging()
 
     log.info(
