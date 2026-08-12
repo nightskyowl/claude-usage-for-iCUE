@@ -111,6 +111,25 @@ progress bars with percentage and reset time.
 - Startup: `install_startup.bat` registers Task Scheduler task `ClaudeQuotaCollector`
   (ONLOGON, validated full interpreter path). The Claude desktop app does NOT need to
   auto-start — the collector is self-sufficient once a valid refresh token exists.
+  If `schtasks` needs admin it falls back to the per-user HKCU Run key — `diagnose.bat`
+  reports which one is active (`scheduled_task` vs `run_key`), and having only the Run key
+  is a healthy state, not a failure.
+- **Packaging is not deploying.** iCUE serves user widgets from
+  `%APPDATA%\Corsair\CUE5\html_widgets\<guid>\`. To ship a widget change, extract
+  `dist/ClaudeQuota.icuewidget` over that folder — replacing files **in place keeps the GUID**,
+  and with it the widget's dashboard placement and configured properties (serverPort, colors).
+  Importing through the iCUE UI instead registers a *new* GUID and forces re-placing and
+  reconfiguring the widget.
+- **iCUE reads widget files only once, at launch.** After deploying, iCUE must be fully quit
+  from its **system-tray icon** (right-click → Quit) and relaunched. Clicking ✕ only minimises
+  to the tray, so the process keeps rendering the version it loaded at startup — which looks
+  exactly like a failed deployment. Check `Get-Process iCUE | Select-Object Id, StartTime`:
+  an unchanged PID/StartTime means iCUE never restarted and the copy is not at fault.
+- **Check the deployed version before diagnosing any widget complaint.** Read
+  `html_widgets\<guid>\manifest.json` — the repo version is *not* necessarily what is on the
+  glass. Widget 1.0.1/1.0.2/1.0.3 were all committed and pushed while iCUE was still running
+  1.0.0, so a "the widget is slow" report was really about long-superseded code. Collector
+  changes never drift this way: the collector runs from the repo directly.
 
 ## Endpoint response shape (normalize defensively)
 
