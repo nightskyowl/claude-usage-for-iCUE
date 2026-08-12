@@ -555,6 +555,15 @@ def refresh_token_flow(creds_path: Path) -> str:
     return new_access_token
 
 
+# The exact 429 friendly message, factored out as a constant so
+# initial_poll_delay() can recognize it (string equality) without duplicating
+# the literal in two places.
+_RATE_LIMIT_MESSAGE = (
+    "HTTP 429 — rate limited by Anthropic; will retry next cycle "
+    "(avoid restarting repeatedly)"
+)
+
+
 def fetch_and_normalize() -> dict:
     """Full fetch cycle: read creds, refresh token if needed, call API,
     normalize. Raises FetchError."""
@@ -584,11 +593,7 @@ def fetch_and_normalize() -> dict:
             # Not an auth failure: never attempt a token refresh or a retry
             # this cycle -- refreshing/retrying on 429 would only make the
             # rate limiting worse.
-            raise FetchError(
-                "HTTP 429 — rate limited by Anthropic; will retry next cycle "
-                "(avoid restarting repeatedly)",
-                status_code=429,
-            )
+            raise FetchError(_RATE_LIMIT_MESSAGE, status_code=429)
         if exc.status_code == 401:
             if NO_REFRESH:
                 raise FetchError(
@@ -689,10 +694,70 @@ def _is_auth_failure(exc: FetchError) -> bool:
     return "401" in message or "token refresh" in message
 
 
+# -- Auth-failure latch -----------------------------------------------------
+#
+# After a poll cycle fails with a 401-class outcome, further polling is
+# pointless (and, against an aggressively rate-limited endpoint, actively
+# harmful) until the user completes a fresh login -- which rewrites the
+# credentials file. So we latch on the credentials file's mtime at the moment
+# of the auth failure: as long as that file's mtime hasn't changed, every
+# subsequent cycle skips all network activity and just re-reports the same
+# actionable error. The moment the mtime changes (a new login happened, or
+# the file's stat outcome otherwise changes), the latch clears and normal
+# polling resumes.
+
+_AUTH_LATCH_ERROR = (
+    "authentication failed — complete a fresh login: open a terminal, run "
+    "claude, then /login (collector retries automatically once the "
+    "credentials file changes)"
+)
+
+_auth_latch: dict = {"active": False, "mtime": None}
+
+# Consecutive-429 counter driving next_poll_delay()'s exponential backoff.
+_consecutive_429s = 0
+_MAX_BACKOFF_SECONDS = 7200
+
+# Kind of the most recent poll_once() outcome: "ok" | "429" | "auth" | "other".
+# Read by poller_loop() (via next_poll_delay()) to decide the next delay.
+_last_poll_status = "ok"
+
+
+def _credentials_mtime(path: Path) -> Optional[float]:
+    """Best-effort mtime of the credentials file; None if it can't be stat'd."""
+    try:
+        return os.path.getmtime(str(path))
+    except OSError:
+        return None
+
+
 def poll_once(path: Path = None) -> dict:
     """Run a single poll cycle: fetch, normalize, write, log. Returns the
-    data that was written."""
+    data that was written.
+
+    Records the outcome kind in the module-level _last_poll_status ("ok" |
+    "429" | "auth" | "other") for next_poll_delay(), and maintains the
+    auth-failure latch (see _auth_latch docs above).
+    """
+    global _last_poll_status
     path = path or DATA_PATH
+
+    if _auth_latch["active"]:
+        current_mtime = _credentials_mtime(CREDENTIALS_PATH)
+        if current_mtime == _auth_latch["mtime"]:
+            result = write_failure(path, _AUTH_LATCH_ERROR)
+            log.info(
+                "skipping poll: authentication latch active (credentials "
+                "file unchanged since last auth failure)"
+            )
+            _last_poll_status = "auth"
+            return result
+        # Credentials file changed (fresh login) or its stat outcome
+        # otherwise changed: clear the latch and fall through to a normal
+        # cycle.
+        _auth_latch["active"] = False
+        _auth_latch["mtime"] = None
+
     try:
         normalized = fetch_and_normalize()
     except FetchError as exc:
@@ -704,25 +769,83 @@ def poll_once(path: Path = None) -> dict:
             _fmt_util(result.get("seven_day")),
         )
         if _is_auth_failure(exc):
+            _auth_latch["active"] = True
+            _auth_latch["mtime"] = _credentials_mtime(CREDENTIALS_PATH)
+            _last_poll_status = "auth"
             try:
                 creds_data = read_credentials(CREDENTIALS_PATH)
             except FetchError:
                 pass
             else:
                 log.info(describe_credentials(creds_data))
+        elif exc.status_code == 429:
+            _last_poll_status = "429"
+        else:
+            _last_poll_status = "other"
         return result
     except Exception as exc:  # noqa: BLE001 - never crash the poller
         result = write_failure(path, f"unexpected error ({exc.__class__.__name__})")
         log.exception("poll failed with unexpected error")
+        _last_poll_status = "other"
         return result
     else:
         write_success(path, normalized)
+        _auth_latch["active"] = False
+        _auth_latch["mtime"] = None
+        _last_poll_status = "ok"
         log.info(
             "poll ok: 5h=%s 7d=%s",
             _fmt_util(normalized.get("five_hour")),
             _fmt_util(normalized.get("seven_day")),
         )
         return normalized
+
+
+def next_poll_delay(status_kind: str) -> int:
+    """Compute the delay (seconds) before the next poll cycle, given the
+    outcome kind ("ok" | "429" | "auth" | "other") of the poll cycle that
+    just ran.
+
+    Consecutive 429s back off exponentially: min(POLL_SECONDS *
+    2**consecutive_429s, _MAX_BACKOFF_SECONDS). Any non-429 outcome resets
+    the counter and returns the normal POLL_SECONDS interval.
+    """
+    global _consecutive_429s
+    if status_kind == "429":
+        _consecutive_429s += 1
+        delay = min(POLL_SECONDS * (2 ** _consecutive_429s), _MAX_BACKOFF_SECONDS)
+        if delay > POLL_SECONDS:
+            log.info("backing off: next poll in %d minutes", delay // 60)
+        return delay
+    _consecutive_429s = 0
+    return POLL_SECONDS
+
+
+def initial_poll_delay(path: Path = None) -> int:
+    """Return how many seconds to wait before the very first poll on
+    startup.
+
+    Normally 0 (poll immediately -- needed for fresh installs). But if the
+    data file on disk already reflects a recent 429 rate-limit failure (exact
+    _RATE_LIMIT_MESSAGE, file mtime younger than POLL_SECONDS), return the
+    remaining seconds instead, so that repeated collector restarts right
+    after a 429 don't immediately re-hammer the endpoint. Pure / side-effect
+    free so it's unit-testable without threads.
+    """
+    path = path or DATA_PATH
+    try:
+        mtime = os.path.getmtime(str(path))
+    except OSError:
+        return 0
+
+    data = read_data_file(path)
+    if data.get("error") != _RATE_LIMIT_MESSAGE:
+        return 0
+
+    age = time.time() - mtime
+    if age >= POLL_SECONDS:
+        return 0
+    return max(0, int(POLL_SECONDS - age))
 
 
 def _fmt_util(window: Optional[dict]) -> str:
@@ -732,9 +855,20 @@ def _fmt_util(window: Optional[dict]) -> str:
 
 
 def poller_loop(stop_event: threading.Event) -> None:
+    delay = initial_poll_delay()
+    if delay > 0:
+        log.info(
+            "recent rate-limit state found; first poll in %d minutes",
+            max(1, delay // 60),
+        )
+        if stop_event.wait(delay):
+            return
+
     while not stop_event.is_set():
         poll_once()
-        stop_event.wait(POLL_SECONDS)
+        delay = next_poll_delay(_last_poll_status)
+        if stop_event.wait(delay):
+            break
 
 
 # --------------------------------------------------------------------------

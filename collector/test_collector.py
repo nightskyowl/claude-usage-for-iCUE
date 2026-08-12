@@ -254,6 +254,16 @@ class PollCycleTests(unittest.TestCase):
         self.addCleanup(setattr, cq, "NO_REFRESH", self._orig_no_refresh)
         cq.NO_REFRESH = False
 
+        # Auth-latch / backoff module state is global and must not leak
+        # between tests (order-independence).
+        self._orig_auth_latch = dict(cq._auth_latch)
+        cq._auth_latch = {"active": False, "mtime": None}
+        self.addCleanup(setattr, cq, "_auth_latch", self._orig_auth_latch)
+
+        self._orig_consecutive_429s = cq._consecutive_429s
+        cq._consecutive_429s = 0
+        self.addCleanup(setattr, cq, "_consecutive_429s", self._orig_consecutive_429s)
+
     def _write_creds(self, oauth_extra=None, top_level_extra=None):
         """Overwrite self.creds_path with a claudeAiOauth block (accessToken
         plus any extra fields like refreshToken/expiresAt) and optional
@@ -1139,6 +1149,14 @@ class RateLimit429Tests(unittest.TestCase):
         cq.NO_REFRESH = False
         self.addCleanup(setattr, cq, "NO_REFRESH", self._orig_no_refresh)
 
+        self._orig_auth_latch = dict(cq._auth_latch)
+        cq._auth_latch = {"active": False, "mtime": None}
+        self.addCleanup(setattr, cq, "_auth_latch", self._orig_auth_latch)
+
+        self._orig_consecutive_429s = cq._consecutive_429s
+        cq._consecutive_429s = 0
+        self.addCleanup(setattr, cq, "_consecutive_429s", self._orig_consecutive_429s)
+
     def test_429_no_refresh_no_retry_exact_message(self):
         refresh_called = []
         cq.post_oauth_refresh = lambda rt: refresh_called.append(rt) or {
@@ -1196,6 +1214,283 @@ class RateLimit429Tests(unittest.TestCase):
         self.assertTrue(any("access_token=present" in line for line in ctx.output))
         self.assertNotIn("fake-token-xyz", "\n".join(ctx.output))
         self.assertNotIn("old-refresh", "\n".join(ctx.output))
+
+
+class AuthLatchTests(unittest.TestCase):
+    """Auth-failure latch (keyed on credentials file mtime): after a
+    401-class outcome, subsequent cycles must skip all network activity as
+    long as the credentials file's mtime is unchanged, and resume the
+    instant it changes (a fresh login)."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.data_path = Path(self.tmpdir.name) / "latest.json"
+        self.creds_path = Path(self.tmpdir.name) / ".credentials.json"
+        self.creds_path.write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "dead-token"}}),
+            encoding="utf-8",
+        )
+
+        self._orig_creds = cq.CREDENTIALS_PATH
+        cq.CREDENTIALS_PATH = self.creds_path
+        self.addCleanup(setattr, cq, "CREDENTIALS_PATH", self._orig_creds)
+
+        self._orig_fetch = cq.fetch_usage_payload
+        self.addCleanup(setattr, cq, "fetch_usage_payload", self._orig_fetch)
+
+        self._orig_post_refresh = cq.post_oauth_refresh
+        self.addCleanup(setattr, cq, "post_oauth_refresh", self._orig_post_refresh)
+
+        self._orig_no_refresh = cq.NO_REFRESH
+        # Force a direct 401 (no refresh token in creds anyway) so these
+        # tests exercise the latch itself, not the refresh flow.
+        cq.NO_REFRESH = True
+        self.addCleanup(setattr, cq, "NO_REFRESH", self._orig_no_refresh)
+
+        self._orig_auth_latch = dict(cq._auth_latch)
+        cq._auth_latch = {"active": False, "mtime": None}
+        self.addCleanup(setattr, cq, "_auth_latch", self._orig_auth_latch)
+
+        self._orig_consecutive_429s = cq._consecutive_429s
+        cq._consecutive_429s = 0
+        self.addCleanup(setattr, cq, "_consecutive_429s", self._orig_consecutive_429s)
+
+    def _fail_401(self):
+        def fake_fetch(token):
+            raise cq.FetchError("HTTP 401", status_code=401)
+
+        cq.fetch_usage_payload = fake_fetch
+
+    def _fail_429(self):
+        def fake_fetch(token):
+            raise cq.FetchError("HTTP 429", status_code=429)
+
+        cq.fetch_usage_payload = fake_fetch
+
+    def _succeed(self):
+        def fake_fetch(token):
+            return {
+                "five_hour": {"utilization": 1, "resets_at": "x"},
+                "seven_day": {"utilization": 2, "resets_at": "y"},
+            }
+
+        cq.fetch_usage_payload = fake_fetch
+
+    def test_latch_set_on_401_outcome(self):
+        self._fail_401()
+        cq.poll_once(self.data_path)
+        self.assertTrue(cq._auth_latch["active"])
+        self.assertEqual(cq._auth_latch["mtime"], os.path.getmtime(str(self.creds_path)))
+        self.assertEqual(cq._last_poll_status, "auth")
+
+    def test_second_cycle_same_mtime_skips_network_and_writes_exact_error(self):
+        self._fail_401()
+        cq.poll_once(self.data_path)
+
+        fetch_calls = []
+
+        def fetch_must_not_be_called(token):
+            fetch_calls.append(token)
+            raise AssertionError("fetch_usage_payload must not be called while latch active")
+
+        cq.fetch_usage_payload = fetch_must_not_be_called
+
+        refresh_calls = []
+
+        def refresh_must_not_be_called(rt):
+            refresh_calls.append(rt)
+            raise AssertionError("post_oauth_refresh must not be called while latch active")
+
+        cq.post_oauth_refresh = refresh_must_not_be_called
+
+        result = cq.poll_once(self.data_path)
+
+        self.assertEqual(fetch_calls, [])
+        self.assertEqual(refresh_calls, [])
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["stale"])
+        self.assertEqual(result["error"], cq._AUTH_LATCH_ERROR)
+        self.assertEqual(
+            result["error"],
+            "authentication failed — complete a fresh login: open a "
+            "terminal, run claude, then /login (collector retries "
+            "automatically once the credentials file changes)",
+        )
+
+    def test_second_cycle_logs_exactly_one_skip_line(self):
+        self._fail_401()
+        cq.poll_once(self.data_path)
+
+        def fetch_must_not_be_called(token):
+            raise AssertionError("must not be called")
+
+        cq.fetch_usage_payload = fetch_must_not_be_called
+
+        with self.assertLogs(cq.log, level="INFO") as ctx:
+            cq.poll_once(self.data_path)
+
+        skip_lines = [line for line in ctx.output if "skipping poll" in line]
+        self.assertEqual(len(skip_lines), 1)
+
+    def test_changed_mtime_clears_latch_and_calls_network_again(self):
+        self._fail_401()
+        cq.poll_once(self.data_path)
+        self.assertTrue(cq._auth_latch["active"])
+
+        # Simulate a fresh login rewriting the credentials file with a
+        # distinctly different mtime.
+        old_mtime = os.path.getmtime(str(self.creds_path))
+        self.creds_path.write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "new-token"}}),
+            encoding="utf-8",
+        )
+        new_mtime = old_mtime + 120.0
+        os.utime(str(self.creds_path), (new_mtime, new_mtime))
+
+        calls = []
+
+        def fake_fetch(token):
+            calls.append(token)
+            return {
+                "five_hour": {"utilization": 1, "resets_at": "x"},
+                "seven_day": {"utilization": 2, "resets_at": "y"},
+            }
+
+        cq.fetch_usage_payload = fake_fetch
+
+        result = cq.poll_once(self.data_path)
+
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(result["ok"])
+        self.assertFalse(cq._auth_latch["active"])
+
+    def test_success_clears_latch(self):
+        self._fail_401()
+        cq.poll_once(self.data_path)
+        self.assertTrue(cq._auth_latch["active"])
+
+        # A fresh login (mtime change) is required to get past the latch
+        # check and reach a real network cycle; that cycle then succeeds.
+        old_mtime = os.path.getmtime(str(self.creds_path))
+        new_mtime = old_mtime + 60.0
+        os.utime(str(self.creds_path), (new_mtime, new_mtime))
+
+        self._succeed()
+        result = cq.poll_once(self.data_path)
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(cq._auth_latch["active"])
+        self.assertIsNone(cq._auth_latch["mtime"])
+        self.assertEqual(cq._last_poll_status, "ok")
+
+    def test_429_does_not_set_latch(self):
+        self._fail_429()
+        cq.poll_once(self.data_path)
+        self.assertFalse(cq._auth_latch["active"])
+        self.assertIsNone(cq._auth_latch["mtime"])
+        self.assertEqual(cq._last_poll_status, "429")
+
+
+class NextPollDelayTests(unittest.TestCase):
+    """next_poll_delay(): exponential backoff on consecutive 429 outcomes,
+    reset by any other outcome."""
+
+    def setUp(self):
+        self._orig_poll_seconds = cq.POLL_SECONDS
+        cq.POLL_SECONDS = 900
+        self.addCleanup(setattr, cq, "POLL_SECONDS", self._orig_poll_seconds)
+
+        self._orig_consecutive_429s = cq._consecutive_429s
+        cq._consecutive_429s = 0
+        self.addCleanup(setattr, cq, "_consecutive_429s", self._orig_consecutive_429s)
+
+    def test_backoff_sequence(self):
+        delays = [cq.next_poll_delay("429") for _ in range(4)]
+        self.assertEqual(delays, [1800, 3600, 7200, 7200])
+
+    def test_reset_after_success(self):
+        cq.next_poll_delay("429")
+        cq.next_poll_delay("429")
+        self.assertEqual(cq.next_poll_delay("ok"), 900)
+        self.assertEqual(cq.next_poll_delay("429"), 1800)  # sequence restarts
+
+    def test_reset_after_non_429_failure_kinds(self):
+        cq.next_poll_delay("429")
+        self.assertEqual(cq.next_poll_delay("auth"), 900)
+        self.assertEqual(cq.next_poll_delay("429"), 1800)
+
+        cq.next_poll_delay("429")
+        self.assertEqual(cq.next_poll_delay("other"), 900)
+        self.assertEqual(cq.next_poll_delay("429"), 1800)
+
+    def test_logs_when_delay_exceeds_poll_seconds(self):
+        with self.assertLogs(cq.log, level="INFO") as ctx:
+            cq.next_poll_delay("429")
+        self.assertTrue(any("backing off" in line for line in ctx.output))
+
+    def test_does_not_log_for_normal_interval(self):
+        with self.assertRaises(AssertionError):
+            with self.assertLogs(cq.log, level="INFO"):
+                cq.next_poll_delay("ok")
+
+
+class InitialPollDelayTests(unittest.TestCase):
+    """initial_poll_delay(): pure, thread-free helper that defers the
+    startup poll when the on-disk data file already reflects a recent 429."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.data_path = Path(self.tmpdir.name) / "latest.json"
+
+        self._orig_poll_seconds = cq.POLL_SECONDS
+        cq.POLL_SECONDS = 900
+        self.addCleanup(setattr, cq, "POLL_SECONDS", self._orig_poll_seconds)
+
+    def _write(self, error, age_seconds=0.0):
+        data = {
+            "ok": False,
+            "stale": True,
+            "error": error,
+            "fetched_at": None,
+            "five_hour": None,
+            "seven_day": None,
+        }
+        cq._atomic_write_json(self.data_path, data)
+        if age_seconds:
+            t = cq.time.time() - age_seconds
+            os.utime(str(self.data_path), (t, t))
+
+    def test_fresh_429_state_defers_first_poll(self):
+        self._write(cq._RATE_LIMIT_MESSAGE, age_seconds=60)
+        delay = cq.initial_poll_delay(self.data_path)
+        self.assertGreater(delay, 0)
+        self.assertLessEqual(delay, 900)
+        self.assertAlmostEqual(delay, 840, delta=5)
+
+    def test_old_429_state_polls_immediately(self):
+        self._write(cq._RATE_LIMIT_MESSAGE, age_seconds=1000)
+        self.assertEqual(cq.initial_poll_delay(self.data_path), 0)
+
+    def test_non_429_error_polls_immediately(self):
+        self._write("some other error", age_seconds=1)
+        self.assertEqual(cq.initial_poll_delay(self.data_path), 0)
+
+    def test_ok_state_polls_immediately(self):
+        data = {
+            "ok": True,
+            "stale": False,
+            "error": None,
+            "fetched_at": "2026-08-12T08:00:00Z",
+            "five_hour": {"utilization": 1, "resets_at": "x"},
+            "seven_day": {"utilization": 2, "resets_at": "y"},
+        }
+        cq._atomic_write_json(self.data_path, data)
+        self.assertEqual(cq.initial_poll_delay(self.data_path), 0)
+
+    def test_missing_file_polls_immediately(self):
+        self.assertEqual(cq.initial_poll_delay(self.data_path), 0)
 
 
 if __name__ == "__main__":
