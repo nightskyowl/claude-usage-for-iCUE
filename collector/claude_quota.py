@@ -120,6 +120,70 @@ CLAUDE_QUOTA_ASSUME_FRACTION = os.environ.get(
     "CLAUDE_QUOTA_ASSUME_FRACTION", ""
 ).strip().lower() in ("1", "true")
 
+
+def _env_int(name: str, default: int, minimum: int) -> int:
+    """Read a positive-integer env override, falling back to `default` on
+    anything unparseable and clamping up to `minimum`."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        log.warning("%s=%r is not an integer; using default %d", name, raw, default)
+        return default
+    if value < minimum:
+        log.warning(
+            "%s=%d is below the %d-second minimum; clamping to %d",
+            name,
+            value,
+            minimum,
+            minimum,
+        )
+        return minimum
+    return value
+
+
+# -- Activity-driven idle pausing -------------------------------------------
+#
+# The quota figures can only move in two situations: the user is actually
+# using Claude, or a usage window rolls over. Polling at any other moment is
+# guaranteed to return the value we already hold, so an idle machine spends
+# its (scarce, rate-limited) request budget learning nothing.
+#
+# Claude Code appends to a per-session transcript under
+# ~/.claude/projects/**/*.jsonl on every turn, so the newest mtime in that
+# tree is a free, purely local, zero-API "is the user working right now"
+# signal.
+#
+# Safety property: this can only ever ADD delay. wait_for_next_poll() observes
+# the delay chosen by next_poll_delay() in full before idleness is even
+# consulted, so the poll cadence, the 429 backoff and the reset-aware
+# pull-forward all keep their exact existing meaning. It is structurally
+# incapable of raising the request rate.
+#
+# Known blind spot: quota consumed via claude.ai in a browser or the Claude
+# desktop app writes no transcript here and therefore reads as "idle".
+# IDLE_MAX_WAIT_SECONDS is the backstop bounding how stale the display can get
+# in that case.
+TRANSCRIPTS_DIR = Path(
+    os.environ.get(
+        "CLAUDE_QUOTA_TRANSCRIPTS_DIR", str(Path.home() / ".claude" / "projects")
+    )
+).expanduser()
+
+# Master off switch: restores the unconditional fixed-cadence behavior.
+NO_IDLE = os.environ.get("CLAUDE_QUOTA_NO_IDLE", "").strip().lower() in ("1", "true")
+
+# Quiet period before the user counts as idle.
+IDLE_AFTER_SECONDS = _env_int("CLAUDE_QUOTA_IDLE_AFTER_SECONDS", 300, 60)
+# Hard cap on the total wait while idle: the heartbeat that still refreshes the
+# display for usage this signal cannot see.
+IDLE_MAX_WAIT_SECONDS = _env_int("CLAUDE_QUOTA_IDLE_POLL_SECONDS", 1800, 60)
+# How often idleness is re-checked while holding; also the worst-case lag
+# between the user resuming work and the poll that follows.
+_IDLE_CHECK_SLICE_SECONDS = 15
+
 # --------------------------------------------------------------------------
 # Normalization helpers
 # --------------------------------------------------------------------------
@@ -916,6 +980,133 @@ def next_poll_delay(
     return candidate
 
 
+# --------------------------------------------------------------------------
+# Activity detection (see the TRANSCRIPTS_DIR block above for rationale)
+# --------------------------------------------------------------------------
+
+
+def newest_activity_mtime(root: Optional[Path] = None) -> Optional[float]:
+    """Newest mtime (epoch seconds) of any Claude Code transcript under `root`,
+    or None when that tree is missing, unreadable or holds no transcripts.
+
+    Best effort by design: every failure mode collapses to None, which
+    is_claude_active() reads as "assume the user is working".
+    """
+    root = root or TRANSCRIPTS_DIR
+    newest: Optional[float] = None
+    try:
+        for dirpath, _dirnames, filenames in os.walk(str(root)):
+            for name in filenames:
+                if not name.endswith(".jsonl"):
+                    continue
+                try:
+                    mtime = os.path.getmtime(os.path.join(dirpath, name))
+                except OSError:
+                    continue
+                if newest is None or mtime > newest:
+                    newest = mtime
+    except OSError:
+        return None
+    return newest
+
+
+def seconds_since_activity(
+    root: Optional[Path] = None, now: Optional[float] = None
+) -> Optional[float]:
+    """Seconds since Claude Code last wrote a transcript, or None if unknown.
+    `now` is injectable (epoch seconds) so this stays unit-testable."""
+    newest = newest_activity_mtime(root)
+    if newest is None:
+        return None
+    now = time.time() if now is None else now
+    return max(0.0, now - newest)
+
+
+def is_claude_active(root: Optional[Path] = None, now: Optional[float] = None) -> bool:
+    """Whether the user appears to be using Claude Code right now.
+
+    Fails OPEN: idle detection disabled, or an absent/unreadable/empty
+    transcript tree, both return True, leaving the collector on exactly its
+    pre-existing cadence. Holding polls is only ever the result of positive
+    evidence that nothing has been written for IDLE_AFTER_SECONDS.
+    """
+    if NO_IDLE:
+        return True
+    age = seconds_since_activity(root, now)
+    if age is None:
+        return True
+    return age <= IDLE_AFTER_SECONDS
+
+
+def idle_extension_allowed(
+    status_kind: str, data: Any = None, now: Optional[datetime] = None
+) -> bool:
+    """Whether the poller may sleep past its normal cadence because the user
+    is idle.
+
+    Only successful cycles qualify, and only when the next poll is not being
+    driven by an imminent window reset. A rollover is the one event that moves
+    the numbers while the user is idle, and catching it promptly is the entire
+    point of the reset-aware scheduling above, so it must never be held back.
+    429-backoff and auth-latch cycles are excluded too: they already impose
+    their own, far longer, delays.
+    """
+    if NO_IDLE or status_kind != "ok":
+        return False
+    until_reset = seconds_until_next_reset(data, now)
+    if until_reset is None:
+        return True
+    candidate = max(until_reset + _RESET_GRACE_SECONDS, _MIN_RESET_POLL_SECONDS)
+    # Mirrors next_poll_delay: a candidate under POLL_SECONDS means the next
+    # poll is reset-driven.
+    return candidate >= POLL_SECONDS
+
+
+def wait_for_next_poll(
+    stop_event: threading.Event,
+    base_delay: int,
+    allow_idle: bool,
+    root: Optional[Path] = None,
+) -> bool:
+    """Sleep until the next poll is due. Returns True if the collector is
+    stopping (so the caller should break out of its loop).
+
+    `base_delay` -- whatever next_poll_delay() chose -- is always observed in
+    full first, which is what keeps the cadence floor, the 429 backoff and the
+    reset-aware pull-forward intact. Only afterwards may idleness add further
+    delay: re-checked every _IDLE_CHECK_SLICE_SECONDS so the first transcript
+    write after a quiet spell brings the next poll within one slice, and
+    capped at IDLE_MAX_WAIT_SECONDS in total so a machine consuming quota
+    invisibly still refreshes on a heartbeat.
+    """
+    if stop_event.wait(base_delay):
+        return True
+    if not allow_idle:
+        return False
+
+    waited = base_delay
+    holding = False
+    while waited < IDLE_MAX_WAIT_SECONDS:
+        if is_claude_active(root):
+            if holding:
+                log.info("activity detected after %ds idle; polling now", waited)
+            return False
+        if not holding:
+            log.info(
+                "idle: no Claude activity for %ds; holding polls (heartbeat at %ds)",
+                IDLE_AFTER_SECONDS,
+                IDLE_MAX_WAIT_SECONDS,
+            )
+            holding = True
+        slice_seconds = min(_IDLE_CHECK_SLICE_SECONDS, IDLE_MAX_WAIT_SECONDS - waited)
+        if stop_event.wait(slice_seconds):
+            return True
+        waited += slice_seconds
+    if holding:
+        log.info("idle heartbeat reached after %ds; polling anyway", waited)
+    return False
+
+
 def initial_poll_delay(path: Path = None) -> int:
     """Return how many seconds to wait before the very first poll on
     startup.
@@ -961,8 +1152,11 @@ def poller_loop(stop_event: threading.Event) -> None:
 
     while not stop_event.is_set():
         result = poll_once()
-        delay = next_poll_delay(_last_poll_status, result)
-        if stop_event.wait(delay):
+        status = _last_poll_status
+        delay = next_poll_delay(status, result)
+        if wait_for_next_poll(
+            stop_event, delay, idle_extension_allowed(status, result)
+        ):
             break
 
 
@@ -1352,6 +1546,23 @@ def _diag_credentials_file(creds_path: Path) -> dict:
     return info
 
 
+def _diag_activity() -> dict:
+    """Build the "activity" section of diag.json: whether idle pausing is
+    enabled and what the transcript signal currently reports. Records only a
+    directory path and an age in seconds -- never transcript contents."""
+    info: dict = {
+        "idle_pausing_enabled": not NO_IDLE,
+        "transcripts_dir": str(TRANSCRIPTS_DIR),
+        "transcripts_dir_exists": TRANSCRIPTS_DIR.is_dir(),
+        "idle_after_seconds": IDLE_AFTER_SECONDS,
+        "idle_heartbeat_seconds": IDLE_MAX_WAIT_SECONDS,
+    }
+    age = seconds_since_activity()
+    info["seconds_since_activity"] = None if age is None else int(age)
+    info["active_now"] = is_claude_active()
+    return info
+
+
 def build_diag(creds_path: Path = None) -> dict:
     """Build the full sanitized --diag payload. Does not touch the network
     (no usage-endpoint call) and never includes any token text."""
@@ -1362,6 +1573,7 @@ def build_diag(creds_path: Path = None) -> dict:
         "platform": sys.platform,
         "credentials_file": _diag_credentials_file(creds_path),
         "credential_manager": _diag_credential_manager(),
+        "activity": _diag_activity(),
         "scheduled_task": _diag_scheduled_task(),
         "run_key": _diag_run_key(),
         "collector_process": _diag_collector_process(),
@@ -1417,9 +1629,14 @@ def main() -> None:
     _configure_file_logging()
 
     log.info(
-        "starting: port=%d poll_seconds=%d creds=%s data=%s log=%s",
+        "starting: port=%d poll_seconds=%d idle=%s creds=%s data=%s log=%s",
         PORT,
         POLL_SECONDS,
+        (
+            "off"
+            if NO_IDLE
+            else f"after {IDLE_AFTER_SECONDS}s, heartbeat {IDLE_MAX_WAIT_SECONDS}s"
+        ),
         CREDENTIALS_PATH,
         DATA_PATH,
         LOG_PATH,

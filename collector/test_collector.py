@@ -1,17 +1,35 @@
 #!/usr/bin/env python3
 """Unit tests for claude_quota.py. Stdlib unittest only, no network access."""
 
+import contextlib
 import io
 import json
 import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+
+@contextlib.contextmanager
+def _env(name, value):
+    """Temporarily set an environment variable, restoring the previous state
+    (including absence) on exit."""
+    sentinel = object()
+    previous = os.environ.get(name, sentinel)
+    os.environ[name] = value
+    try:
+        yield
+    finally:
+        if previous is sentinel:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = previous
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -2131,6 +2149,342 @@ class InitialPollDelayTests(unittest.TestCase):
 
     def test_missing_file_polls_immediately(self):
         self.assertEqual(cq.initial_poll_delay(self.data_path), 0)
+
+
+# --------------------------------------------------------------------------
+# Activity-driven idle pausing
+# --------------------------------------------------------------------------
+
+
+class _ActivityTempTree(unittest.TestCase):
+    """Base fixture: an isolated fake ~/.claude/projects tree plus restored
+    module-level idle config. Never touches the user's real transcripts."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory(prefix="claude-quota-test-tx-")
+        self.addCleanup(self.tmpdir.cleanup)
+        self.root = Path(self.tmpdir.name)
+
+        for name, value in (
+            ("NO_IDLE", False),
+            ("IDLE_AFTER_SECONDS", 300),
+            ("IDLE_MAX_WAIT_SECONDS", 1800),
+            ("TRANSCRIPTS_DIR", self.root),
+        ):
+            self.addCleanup(setattr, cq, name, getattr(cq, name))
+            setattr(cq, name, value)
+
+    def _transcript(self, name="session.jsonl", age_seconds=0.0, subdir="proj-a"):
+        """Create a .jsonl whose mtime is `age_seconds` in the past."""
+        directory = self.root / subdir
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / name
+        path.write_text("{}\n", encoding="utf-8")
+        stamp = time.time() - age_seconds
+        os.utime(path, (stamp, stamp))
+        return path
+
+
+class NewestActivityMtimeTests(_ActivityTempTree):
+    """newest_activity_mtime(): max mtime over the transcript tree, best
+    effort, None on anything unusable."""
+
+    def test_finds_newest_across_nested_project_dirs(self):
+        self._transcript("old.jsonl", age_seconds=5000, subdir="proj-a")
+        newest = self._transcript("new.jsonl", age_seconds=10, subdir="proj-b/nested")
+        self.assertAlmostEqual(
+            cq.newest_activity_mtime(self.root),
+            os.path.getmtime(newest),
+            places=3,
+        )
+
+    def test_ignores_non_jsonl_files(self):
+        (self.root / "notes.txt").write_text("x", encoding="utf-8")
+        self.assertIsNone(cq.newest_activity_mtime(self.root))
+
+    def test_missing_directory_returns_none(self):
+        self.assertIsNone(cq.newest_activity_mtime(self.root / "does-not-exist"))
+
+    def test_empty_tree_returns_none(self):
+        self.assertIsNone(cq.newest_activity_mtime(self.root))
+
+
+class SecondsSinceActivityTests(_ActivityTempTree):
+    def test_reports_age_of_newest_transcript(self):
+        self._transcript(age_seconds=120)
+        age = cq.seconds_since_activity(self.root)
+        self.assertIsNotNone(age)
+        self.assertAlmostEqual(age, 120, delta=5)
+
+    def test_none_when_no_transcripts(self):
+        self.assertIsNone(cq.seconds_since_activity(self.root))
+
+    def test_clock_skew_never_yields_negative_age(self):
+        """A transcript mtime in the future (clock change, NTP step) must not
+        produce a negative age that could confuse the comparison."""
+        self._transcript(age_seconds=-600)
+        self.assertEqual(cq.seconds_since_activity(self.root), 0.0)
+
+
+class IsClaudeActiveTests(_ActivityTempTree):
+    """is_claude_active(): the fail-open predicate. Only positive evidence of
+    a quiet period may ever report idle."""
+
+    def test_recent_transcript_is_active(self):
+        self._transcript(age_seconds=5)
+        self.assertTrue(cq.is_claude_active(self.root))
+
+    def test_old_transcript_is_idle(self):
+        self._transcript(age_seconds=3000)
+        self.assertFalse(cq.is_claude_active(self.root))
+
+    def test_boundary_is_inclusive(self):
+        self._transcript(age_seconds=0)
+        self.assertTrue(cq.is_claude_active(self.root, now=time.time() + 300))
+        self.assertFalse(cq.is_claude_active(self.root, now=time.time() + 301))
+
+    def test_missing_tree_fails_open_to_active(self):
+        """A user whose transcripts live elsewhere must keep the old cadence,
+        never get silently paused."""
+        self.assertTrue(cq.is_claude_active(self.root / "nope"))
+
+    def test_empty_tree_fails_open_to_active(self):
+        self.assertTrue(cq.is_claude_active(self.root))
+
+    def test_no_idle_flag_forces_active(self):
+        cq.NO_IDLE = True
+        self._transcript(age_seconds=99999)
+        self.assertTrue(cq.is_claude_active(self.root))
+
+
+class IdleExtensionAllowedTests(_ActivityTempTree):
+    """idle_extension_allowed(): which cycles may be held. Guards the
+    Phase 1 reset-aware behavior against regression."""
+
+    def setUp(self):
+        super().setUp()
+        self._orig_poll_seconds = cq.POLL_SECONDS
+        cq.POLL_SECONDS = 900
+        self.addCleanup(setattr, cq, "POLL_SECONDS", self._orig_poll_seconds)
+
+    def _allowed(self, status, seconds_ahead=None):
+        data = (
+            None
+            if seconds_ahead is None
+            else _payload(
+                five_hour=(_NOW + timedelta(seconds=seconds_ahead)).isoformat()
+            )
+        )
+        return cq.idle_extension_allowed(status, data, _NOW)
+
+    def test_ok_cycle_with_distant_reset_may_be_held(self):
+        self.assertTrue(self._allowed("ok", 4 * 3600))
+
+    def test_ok_cycle_with_no_reset_data_may_be_held(self):
+        self.assertTrue(self._allowed("ok"))
+
+    def test_imminent_reset_is_never_held(self):
+        """The rollover is the one event that moves the numbers while idle."""
+        self.assertFalse(self._allowed("ok", 200))
+
+    def test_null_resets_at_may_be_held(self):
+        """Observed live just after a rollover: utilization 0, resets_at null."""
+        data = _payload(five_hour=None, seven_day=None)
+        self.assertTrue(cq.idle_extension_allowed("ok", data, _NOW))
+
+    def test_backoff_and_auth_cycles_are_never_held(self):
+        for status in ("429", "auth", "other"):
+            with self.subTest(status=status):
+                self.assertFalse(self._allowed(status, 4 * 3600))
+
+    def test_no_idle_flag_disables_holding(self):
+        cq.NO_IDLE = True
+        self.assertFalse(self._allowed("ok", 4 * 3600))
+
+
+class WaitForNextPollTests(_ActivityTempTree):
+    """wait_for_next_poll(): the safety-critical piece. The base delay is
+    always observed in full, so idle pausing can only ever ADD delay."""
+
+    def setUp(self):
+        super().setUp()
+        self.waits = []
+
+    def _stop_event(self, stop_after=None):
+        """A stop_event stub recording every wait() and optionally signalling
+        a stop on the Nth call."""
+        waits = self.waits
+
+        class _Stub:
+            def __init__(self):
+                self.calls = 0
+
+            def wait(self, timeout):
+                self.calls += 1
+                waits.append(timeout)
+                return stop_after is not None and self.calls >= stop_after
+
+            def is_set(self):
+                return False
+
+        return _Stub()
+
+    def test_base_delay_always_waited_in_full(self):
+        self._transcript(age_seconds=5)  # active
+        cq.wait_for_next_poll(self._stop_event(), 900, allow_idle=True, root=self.root)
+        self.assertEqual(self.waits[0], 900)
+
+    def test_active_user_adds_no_extra_delay(self):
+        self._transcript(age_seconds=5)
+        cq.wait_for_next_poll(self._stop_event(), 900, allow_idle=True, root=self.root)
+        self.assertEqual(self.waits, [900])
+
+    def test_allow_idle_false_adds_no_extra_delay(self):
+        self._transcript(age_seconds=99999)  # idle, but holding not permitted
+        cq.wait_for_next_poll(self._stop_event(), 900, allow_idle=False, root=self.root)
+        self.assertEqual(self.waits, [900])
+
+    def test_idle_user_holds_in_slices_up_to_heartbeat(self):
+        self._transcript(age_seconds=99999)
+        cq.wait_for_next_poll(self._stop_event(), 900, allow_idle=True, root=self.root)
+        # 900 base, then 15s slices until the 1800s heartbeat cap.
+        self.assertEqual(self.waits[0], 900)
+        self.assertEqual(sum(self.waits), cq.IDLE_MAX_WAIT_SECONDS)
+        self.assertTrue(all(w <= 15 for w in self.waits[1:]))
+
+    def test_heartbeat_is_a_hard_cap(self):
+        self._transcript(age_seconds=99999)
+        cq.IDLE_MAX_WAIT_SECONDS = 1200
+        cq.wait_for_next_poll(self._stop_event(), 900, allow_idle=True, root=self.root)
+        self.assertEqual(sum(self.waits), 1200)
+
+    def test_heartbeat_below_base_delay_never_shortens_the_wait(self):
+        """A misconfigured heartbeat under POLL_SECONDS must not reduce the
+        base delay -- it just means no extension happens."""
+        self._transcript(age_seconds=99999)
+        cq.IDLE_MAX_WAIT_SECONDS = 60
+        cq.wait_for_next_poll(self._stop_event(), 900, allow_idle=True, root=self.root)
+        self.assertEqual(self.waits, [900])
+
+    def test_resumed_activity_ends_the_hold_within_one_slice(self):
+        transcript = self._transcript(age_seconds=99999)
+        event = self._stop_event()
+        original_wait = event.wait
+
+        def wait_and_touch(timeout):
+            # After the base delay and two idle slices, the user comes back.
+            result = original_wait(timeout)
+            if event.calls == 3:
+                now = time.time()
+                os.utime(transcript, (now, now))
+            return result
+
+        event.wait = wait_and_touch
+        cq.wait_for_next_poll(event, 900, allow_idle=True, root=self.root)
+        self.assertEqual(self.waits, [900, 15, 15])
+        self.assertLess(sum(self.waits), cq.IDLE_MAX_WAIT_SECONDS)
+
+    def test_stop_during_base_delay_reports_stopping(self):
+        self._transcript(age_seconds=5)
+        self.assertTrue(
+            cq.wait_for_next_poll(
+                self._stop_event(stop_after=1), 900, allow_idle=True, root=self.root
+            )
+        )
+
+    def test_stop_during_idle_hold_reports_stopping(self):
+        self._transcript(age_seconds=99999)
+        self.assertTrue(
+            cq.wait_for_next_poll(
+                self._stop_event(stop_after=2), 900, allow_idle=True, root=self.root
+            )
+        )
+
+    def test_logs_hold_and_resume(self):
+        transcript = self._transcript(age_seconds=99999)
+        event = self._stop_event()
+        original_wait = event.wait
+
+        def wait_and_touch(timeout):
+            result = original_wait(timeout)
+            if event.calls == 2:
+                now = time.time()
+                os.utime(transcript, (now, now))
+            return result
+
+        event.wait = wait_and_touch
+        with self.assertLogs(cq.log, level="INFO") as ctx:
+            cq.wait_for_next_poll(event, 900, allow_idle=True, root=self.root)
+        self.assertTrue(any("holding polls" in line for line in ctx.output))
+        self.assertTrue(any("activity detected" in line for line in ctx.output))
+
+    def test_active_hold_is_silent(self):
+        self._transcript(age_seconds=5)
+        with self.assertRaises(AssertionError):
+            with self.assertLogs(cq.log, level="INFO"):
+                cq.wait_for_next_poll(
+                    self._stop_event(), 900, allow_idle=True, root=self.root
+                )
+
+
+class IdleConfigEnvTests(unittest.TestCase):
+    """_env_int(): tolerant parsing of the idle-tuning env overrides."""
+
+    def test_absent_uses_default(self):
+        os.environ.pop("CLAUDE_QUOTA_TEST_INT", None)
+        self.assertEqual(cq._env_int("CLAUDE_QUOTA_TEST_INT", 300, 60), 300)
+
+    def test_blank_uses_default(self):
+        with _env("CLAUDE_QUOTA_TEST_INT", "   "):
+            self.assertEqual(cq._env_int("CLAUDE_QUOTA_TEST_INT", 300, 60), 300)
+
+    def test_garbage_uses_default_and_warns(self):
+        with _env("CLAUDE_QUOTA_TEST_INT", "soon"):
+            with self.assertLogs(cq.log, level="WARNING"):
+                self.assertEqual(cq._env_int("CLAUDE_QUOTA_TEST_INT", 300, 60), 300)
+
+    def test_below_minimum_clamps_and_warns(self):
+        with _env("CLAUDE_QUOTA_TEST_INT", "5"):
+            with self.assertLogs(cq.log, level="WARNING"):
+                self.assertEqual(cq._env_int("CLAUDE_QUOTA_TEST_INT", 300, 60), 60)
+
+    def test_valid_override_is_honoured(self):
+        with _env("CLAUDE_QUOTA_TEST_INT", "120"):
+            self.assertEqual(cq._env_int("CLAUDE_QUOTA_TEST_INT", 300, 60), 120)
+
+
+class ActivityDiagTests(_ActivityTempTree):
+    """_diag_activity(): observable state for diagnose.bat, no transcript
+    contents."""
+
+    def test_reports_active_state_and_config(self):
+        self._transcript(age_seconds=10)
+        section = cq._diag_activity()
+        self.assertTrue(section["idle_pausing_enabled"])
+        self.assertTrue(section["transcripts_dir_exists"])
+        self.assertTrue(section["active_now"])
+        self.assertLess(section["seconds_since_activity"], 60)
+        self.assertEqual(section["idle_after_seconds"], 300)
+
+    def test_reports_idle_state(self):
+        self._transcript(age_seconds=3000)
+        section = cq._diag_activity()
+        self.assertFalse(section["active_now"])
+        self.assertGreater(section["seconds_since_activity"], 300)
+
+    def test_missing_tree_reports_unknown_age_but_active(self):
+        cq.TRANSCRIPTS_DIR = self.root / "nope"
+        section = cq._diag_activity()
+        self.assertFalse(section["transcripts_dir_exists"])
+        self.assertIsNone(section["seconds_since_activity"])
+        self.assertTrue(section["active_now"])
+
+    def test_never_leaks_transcript_contents(self):
+        path = self._transcript(age_seconds=10)
+        path.write_text('{"secret":"sk-ant-not-a-real-token"}\n', encoding="utf-8")
+        blob = json.dumps(cq._diag_activity())
+        self.assertNotIn("sk-ant", blob)
+        self.assertNotIn("secret", blob)
 
 
 if __name__ == "__main__":

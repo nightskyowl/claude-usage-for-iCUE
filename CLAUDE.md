@@ -25,6 +25,22 @@ progress bars with percentage and reset time.
      ever *shortens* the wait, never extends it, and is ignored entirely during 429 backoff
      and while the auth latch is active, so a rate-limited collector can't be dragged back
      into polling by a reset boundary. Costs ≤1 extra request per rollover.
+   - **Activity-driven idle pausing**: the quota can only move when the user is using
+     Claude or when a window rolls over, so polling at any other time returns a value we
+     already hold. Claude Code appends to `~/.claude/projects/**/*.jsonl` on every turn,
+     making the newest mtime there a free, local, zero-API "is the user working" signal
+     (`is_claude_active()`). After a quiet period (`IDLE_AFTER_SECONDS`, default 300 s)
+     the poller keeps sleeping, re-checking every 15 s, up to a heartbeat cap
+     (`IDLE_MAX_WAIT_SECONDS`, default 1800 s).
+     **Safety property: this can only ever *add* delay.** `wait_for_next_poll()` observes
+     the delay chosen by `next_poll_delay()` in full *before* idleness is consulted, so
+     the cadence floor, the 429 backoff and the reset-aware pull-forward all keep their
+     exact meaning — it is structurally incapable of raising the request rate. An imminent
+     reset is never held (`idle_extension_allowed()`), preserving the Phase 1 rollover fix.
+     Fails **open**: a missing/unreadable/empty transcript tree, or `CLAUDE_QUOTA_NO_IDLE=1`,
+     both mean "assume active", i.e. exactly the old behaviour. Blind spot: usage via
+     claude.ai in a browser or the desktop app writes no transcript and reads as idle —
+     the heartbeat is the backstop that bounds staleness there.
    - On any failure, keeps serving the last good result (adds `stale: true`).
    - **Auto-refreshes the OAuth token** (user-approved): if the access token is expired or
      the API returns 401, it POSTs the refresh token to
