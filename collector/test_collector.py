@@ -1129,6 +1129,20 @@ class DiagModeTests(unittest.TestCase):
         result = cq._diag_credential_manager()
         self.assertEqual(result, {"available": False, "claude_targets": []})
 
+    def test_diag_includes_scheduled_task_and_collector_process_sections(self):
+        # build_diag() must never touch the network and (on this platform)
+        # never actually shells out in a way that breaks the test -- both
+        # new sections are exercised in isolation elsewhere; here we just
+        # confirm build_diag() wires them into the top-level payload.
+        diag = cq.build_diag()
+        self.assertIn("scheduled_task", diag)
+        self.assertIn("collector_process", diag)
+        for key in ("available", "exists", "status", "task_to_run",
+                    "last_run_time", "last_result", "raw_first_lines"):
+            self.assertIn(key, diag["scheduled_task"])
+        for key in ("available", "running", "pids"):
+            self.assertIn(key, diag["collector_process"])
+
 
 class DiagCliInvocationTests(unittest.TestCase):
     """--diag via sys.argv must not start the server/poller and must exit
@@ -1199,6 +1213,234 @@ class DiagCliInvocationTests(unittest.TestCase):
         sys.argv = ["claude_quota.py", "--diag"]
         cq.main()  # must return normally (i.e. exit 0), not start server/poller
         self.assertTrue(self.diag_path.exists())
+
+
+class ScheduledTaskAndCollectorProcessDiagTests(unittest.TestCase):
+    """Coverage for the "scheduled_task" and "collector_process" diag.json
+    sections: the schtasks LIST parser (fixture-driven, no subprocess), and
+    the non-Windows availability:False short-circuit for both."""
+
+    # -- _parse_schtasks_list_output(): English labels ---------------------
+
+    _ENGLISH_LIST_OUTPUT = (
+        "\n"
+        "Folder: \\\n"
+        "HostName:                            DESKTOP-TEST\n"
+        "TaskName:                            \\ClaudeQuotaCollector\n"
+        "Next Run Time:                       8/13/2026 9:00:00 AM\n"
+        "Status:                               Ready\n"
+        "Logon Mode:                          Interactive/Background\n"
+        "Last Run Time:                       8/12/2026 9:00:00 AM\n"
+        "Last Result:                          0\n"
+        "Author:                              DESKTOP-TEST\\user\n"
+        "Task To Run:                         C:\\Users\\user\\AppData\\Local\\"
+        "Programs\\Python\\Python311\\pythonw.exe C:\\path\\to\\claude_quota.py\n"
+        "Start In:                            C:\\path\\to\n"
+        "Comment:                             N/A\n"
+        "Scheduled Task State:                Enabled\n"
+    )
+
+    def test_parser_extracts_known_english_fields(self):
+        parsed = cq._parse_schtasks_list_output(self._ENGLISH_LIST_OUTPUT)
+        self.assertEqual(parsed["status"], "Ready")
+        self.assertEqual(parsed["last_run_time"], "8/12/2026 9:00:00 AM")
+        self.assertEqual(parsed["last_result"], "0")
+        self.assertIn("pythonw.exe", parsed["task_to_run"])
+        self.assertIn("claude_quota.py", parsed["task_to_run"])
+
+    def test_parser_raw_first_lines_capped_at_12_and_120_chars(self):
+        long_line = "Comment:                             " + ("x" * 300)
+        output = self._ENGLISH_LIST_OUTPUT + long_line + "\n" + "Extra: y\n" * 5
+        parsed = cq._parse_schtasks_list_output(output)
+        self.assertLessEqual(len(parsed["raw_first_lines"]), 12)
+        for line in parsed["raw_first_lines"]:
+            self.assertLessEqual(len(line), 120)
+
+    def test_parser_ignores_blank_lines_for_raw_first_lines(self):
+        output = "\n\n" + self._ENGLISH_LIST_OUTPUT
+        parsed = cq._parse_schtasks_list_output(output)
+        self.assertTrue(all(line.strip() for line in parsed["raw_first_lines"]))
+
+    # -- _parse_schtasks_list_output(): localized / unrecognized labels ----
+
+    _LOCALIZED_LIST_OUTPUT = (
+        "\u6587\u4ef6\u5939: \\\n"
+        "\u4e3b\u673a\u540d:                            DESKTOP-TEST\n"
+        "\u4efb\u52a1\u540d:                            \\ClaudeQuotaCollector\n"
+        "\u4e0b\u6b21\u8fd0\u884c\u65f6\u95f4:                8/13/2026 9:00:00 AM\n"
+        "\u72b6\u6001:                               \u5c31\u7eea\n"
+        "\u4e0a\u6b21\u8fd0\u884c\u65f6\u95f4:                8/12/2026 9:00:00 AM\n"
+        "\u4e0a\u6b21\u7ed3\u679c:                       0\n"
+    )
+
+    def test_parser_leaves_fields_none_when_labels_unrecognized(self):
+        parsed = cq._parse_schtasks_list_output(self._LOCALIZED_LIST_OUTPUT)
+        self.assertIsNone(parsed["status"])
+        self.assertIsNone(parsed["task_to_run"])
+        self.assertIsNone(parsed["last_run_time"])
+        self.assertIsNone(parsed["last_result"])
+        # raw_first_lines still gives a human something to read
+        self.assertTrue(len(parsed["raw_first_lines"]) > 0)
+        self.assertIn("DESKTOP-TEST", " ".join(parsed["raw_first_lines"]))
+
+    # -- non-Windows availability:False short-circuits ----------------------
+
+    def test_scheduled_task_available_false_on_non_windows(self):
+        if sys.platform == "win32":
+            self.skipTest("this assertion targets non-Windows behavior")
+        result = cq._diag_scheduled_task()
+        self.assertEqual(
+            result,
+            {
+                "available": False,
+                "exists": False,
+                "status": None,
+                "task_to_run": None,
+                "last_run_time": None,
+                "last_result": None,
+                "raw_first_lines": [],
+            },
+        )
+
+    def test_collector_process_available_false_on_non_windows(self):
+        if sys.platform == "win32":
+            self.skipTest("this assertion targets non-Windows behavior")
+        result = cq._diag_collector_process()
+        self.assertEqual(
+            result, {"available": False, "running": False, "pids": []}
+        )
+
+    def test_diag_scheduled_task_never_raises_when_schtasks_missing(self):
+        # Simulate "schtasks invocation fails" (e.g. binary missing) by
+        # monkeypatching subprocess.run to raise, regardless of platform --
+        # available must come back False, never propagate the exception.
+        orig_run = cq.subprocess.run
+        orig_platform = cq.sys.platform
+
+        def _boom(*args, **kwargs):
+            raise FileNotFoundError("schtasks not found")
+
+        cq.subprocess.run = _boom
+        cq.sys.platform = "win32"
+        try:
+            result = cq._diag_scheduled_task()
+        finally:
+            cq.subprocess.run = orig_run
+            cq.sys.platform = orig_platform
+
+        self.assertFalse(result["available"])
+        self.assertFalse(result["exists"])
+
+    def test_diag_collector_process_never_raises_when_powershell_missing(self):
+        orig_run = cq.subprocess.run
+        orig_platform = cq.sys.platform
+
+        def _boom(*args, **kwargs):
+            raise FileNotFoundError("powershell not found")
+
+        cq.subprocess.run = _boom
+        cq.sys.platform = "win32"
+        try:
+            result = cq._diag_collector_process()
+        finally:
+            cq.subprocess.run = orig_run
+            cq.sys.platform = orig_platform
+
+        self.assertFalse(result["available"])
+        self.assertFalse(result["running"])
+        self.assertEqual(result["pids"], [])
+
+    def test_diag_scheduled_task_parses_mocked_subprocess_output(self):
+        # Full path (Windows-forced): subprocess.run mocked to return a
+        # canned CompletedProcess, confirms _diag_scheduled_task() wires the
+        # parser output into the result dict correctly.
+        import types
+
+        orig_run = cq.subprocess.run
+        orig_platform = cq.sys.platform
+
+        def _fake_run(*args, **kwargs):
+            return types.SimpleNamespace(
+                returncode=0, stdout=self._ENGLISH_LIST_OUTPUT, stderr=""
+            )
+
+        cq.subprocess.run = _fake_run
+        cq.sys.platform = "win32"
+        try:
+            result = cq._diag_scheduled_task()
+        finally:
+            cq.subprocess.run = orig_run
+            cq.sys.platform = orig_platform
+
+        self.assertTrue(result["available"])
+        self.assertTrue(result["exists"])
+        self.assertEqual(result["status"], "Ready")
+        self.assertEqual(result["last_result"], "0")
+
+    def test_diag_scheduled_task_not_found_sets_exists_false(self):
+        import types
+
+        orig_run = cq.subprocess.run
+        orig_platform = cq.sys.platform
+
+        def _fake_run(*args, **kwargs):
+            return types.SimpleNamespace(
+                returncode=1, stdout="ERROR: The system cannot find the file specified.\n", stderr=""
+            )
+
+        cq.subprocess.run = _fake_run
+        cq.sys.platform = "win32"
+        try:
+            result = cq._diag_scheduled_task()
+        finally:
+            cq.subprocess.run = orig_run
+            cq.sys.platform = orig_platform
+
+        self.assertTrue(result["available"])
+        self.assertFalse(result["exists"])
+        self.assertIsNone(result["status"])
+
+    def test_diag_collector_process_parses_mocked_pids(self):
+        import types
+
+        orig_run = cq.subprocess.run
+        orig_platform = cq.sys.platform
+
+        def _fake_run(*args, **kwargs):
+            return types.SimpleNamespace(returncode=0, stdout="1234\n5678\n", stderr="")
+
+        cq.subprocess.run = _fake_run
+        cq.sys.platform = "win32"
+        try:
+            result = cq._diag_collector_process()
+        finally:
+            cq.subprocess.run = orig_run
+            cq.sys.platform = orig_platform
+
+        self.assertTrue(result["available"])
+        self.assertTrue(result["running"])
+        self.assertEqual(result["pids"], [1234, 5678])
+
+    def test_diag_collector_process_no_matches_not_running(self):
+        import types
+
+        orig_run = cq.subprocess.run
+        orig_platform = cq.sys.platform
+
+        def _fake_run(*args, **kwargs):
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        cq.subprocess.run = _fake_run
+        cq.sys.platform = "win32"
+        try:
+            result = cq._diag_collector_process()
+        finally:
+            cq.subprocess.run = orig_run
+            cq.sys.platform = orig_platform
+
+        self.assertTrue(result["available"])
+        self.assertFalse(result["running"])
+        self.assertEqual(result["pids"], [])
 
 
 class RateLimit429Tests(unittest.TestCase):

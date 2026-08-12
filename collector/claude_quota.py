@@ -20,6 +20,7 @@ import logging
 import os
 import platform
 import signal
+import subprocess
 import sys
 import tempfile
 import threading
@@ -1005,6 +1006,136 @@ def _diag_credential_manager() -> dict:
         return {"available": False, "claude_targets": []}
 
 
+def _parse_schtasks_list_output(output: str) -> dict:
+    """Parse the stdout of `schtasks /Query /TN ... /V /FO LIST` into the
+    fields the "scheduled_task" diag.json section needs.
+
+    Field labels are matched case-insensitively against the text before the
+    first colon on each line; the rest of the line (after that first colon)
+    is kept verbatim as the value, since values themselves may contain
+    colons (e.g. a drive letter in "Task To Run: C:\\path\\..."). Field
+    labels are localized on non-English Windows -- if a line's label isn't
+    one of the ones we recognize, it's simply skipped and the corresponding
+    field stays None; "raw_first_lines" is filled regardless so a human can
+    still read the localized output."""
+    fields: dict = {
+        "status": None,
+        "task_to_run": None,
+        "last_run_time": None,
+        "last_result": None,
+    }
+    label_map = {
+        "status": "status",
+        "task to run": "task_to_run",
+        "last run time": "last_run_time",
+        "last result": "last_result",
+    }
+
+    non_empty_lines = []
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        non_empty_lines.append(line)
+        if ":" not in line:
+            continue
+        label, _, value = line.partition(":")
+        key = label_map.get(label.strip().lower())
+        if key is not None:
+            fields[key] = value.strip()
+
+    fields["raw_first_lines"] = [ln[:120] for ln in non_empty_lines[:12]]
+    return fields
+
+
+def _diag_scheduled_task() -> dict:
+    """Query Windows Task Scheduler for the "ClaudeQuotaCollector" at-logon
+    task via `schtasks /Query`, so the task's presence/status can be
+    verified without terminal access. available:False on non-Windows or if
+    the schtasks invocation itself fails for any reason (missing binary,
+    timeout, permissions, ...). exists reflects whether schtasks found the
+    task (returncode == 0); status/task_to_run/last_run_time/last_result are
+    best-effort parses of the LIST output and stay None if unparseable
+    (e.g. localized field labels) even though exists is still True."""
+    result: dict = {
+        "available": False,
+        "exists": False,
+        "status": None,
+        "task_to_run": None,
+        "last_run_time": None,
+        "last_result": None,
+        "raw_first_lines": [],
+    }
+    if sys.platform != "win32":
+        return result
+
+    try:
+        proc = subprocess.run(
+            ["schtasks", "/Query", "/TN", "ClaudeQuotaCollector", "/V", "/FO", "LIST"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except Exception:  # noqa: BLE001 - diagnostics must never crash
+        return result
+
+    result["available"] = True
+    result["exists"] = proc.returncode == 0
+    if not result["exists"]:
+        return result
+
+    result.update(_parse_schtasks_list_output(proc.stdout or ""))
+    return result
+
+
+def _diag_collector_process() -> dict:
+    """Check whether a collector process (`python.../claude_quota.py`, no
+    server mode) is currently running, via a PowerShell Win32_Process query.
+    Excludes any matching process whose command line also contains
+    "--diag" so a concurrent `--diag` invocation never reports itself as
+    the running collector. available/running False on any failure or on
+    non-Windows."""
+    result: dict = {"available": False, "running": False, "pids": []}
+    if sys.platform != "win32":
+        return result
+
+    try:
+        proc = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_Process -Filter \"Name like 'python%'\" | "
+                "Where-Object {$_.CommandLine -like '*claude_quota.py*' -and "
+                "$_.CommandLine -notlike '*--diag*'} | "
+                "Select-Object -ExpandProperty ProcessId",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except Exception:  # noqa: BLE001 - diagnostics must never crash
+        return result
+
+    result["available"] = True
+    if proc.returncode != 0:
+        return result
+
+    pids = []
+    for line in (proc.stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            pids.append(int(line))
+        except ValueError:
+            continue
+
+    result["pids"] = pids
+    result["running"] = len(pids) > 0
+    return result
+
+
 def _diag_credentials_file(creds_path: Path) -> dict:
     """Build the sanitized "credentials_file" section of diag.json. Never
     reads/includes any token text, prefix, or fragment."""
@@ -1069,6 +1200,8 @@ def build_diag(creds_path: Path = None) -> dict:
         "platform": sys.platform,
         "credentials_file": _diag_credentials_file(creds_path),
         "credential_manager": _diag_credential_manager(),
+        "scheduled_task": _diag_scheduled_task(),
+        "collector_process": _diag_collector_process(),
     }
 
 
