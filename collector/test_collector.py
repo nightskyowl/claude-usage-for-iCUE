@@ -245,6 +245,24 @@ class PollCycleTests(unittest.TestCase):
         self._orig_fetch = cq.fetch_usage_payload
         self.addCleanup(setattr, cq, "fetch_usage_payload", self._orig_fetch)
 
+        self._orig_post_refresh = cq.post_oauth_refresh
+        self.addCleanup(setattr, cq, "post_oauth_refresh", self._orig_post_refresh)
+
+        self._orig_no_refresh = cq.NO_REFRESH
+        self.addCleanup(setattr, cq, "NO_REFRESH", self._orig_no_refresh)
+        cq.NO_REFRESH = False
+
+    def _write_creds(self, oauth_extra=None, top_level_extra=None):
+        """Overwrite self.creds_path with a claudeAiOauth block (accessToken
+        plus any extra fields like refreshToken/expiresAt) and optional
+        sibling top-level keys, for refresh-flow tests."""
+        oauth = {"accessToken": "fake-token-xyz"}
+        oauth.update(oauth_extra or {})
+        content = {"claudeAiOauth": oauth}
+        content.update(top_level_extra or {})
+        self.creds_path.write_text(json.dumps(content), encoding="utf-8")
+        return content
+
     def _read_data(self):
         with open(self.data_path, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -320,6 +338,263 @@ class PollCycleTests(unittest.TestCase):
         self.assertTrue(result["stale"])
         self.assertIn("credentials", result["error"])
 
+    # -- OAuth refresh integration (poll-cycle level) --------------------
+
+    def test_proactive_refresh_when_expires_at_is_past(self):
+        now_ms = int(cq.time.time() * 1000)
+        self._write_creds({"refreshToken": "old-refresh", "expiresAt": now_ms - 1000})
+
+        cq.post_oauth_refresh = lambda rt: {
+            "access_token": "fresh-token-123",
+            "refresh_token": "fresh-refresh-456",
+            "expires_in": 3600,
+        }
+
+        tokens_used = []
+
+        def fake_fetch(token):
+            tokens_used.append(token)
+            return {
+                "five_hour": {"utilization": 10, "resets_at": "x"},
+                "seven_day": {"utilization": 20, "resets_at": "y"},
+            }
+
+        cq.fetch_usage_payload = fake_fetch
+
+        result = cq.poll_once(self.data_path)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(tokens_used, ["fresh-token-123"])
+
+        on_disk_creds = json.loads(self.creds_path.read_text(encoding="utf-8"))
+        self.assertEqual(on_disk_creds["claudeAiOauth"]["accessToken"], "fresh-token-123")
+
+        backup_path = self.creds_path.with_name(self.creds_path.name + ".claude-quota.bak")
+        self.assertTrue(backup_path.exists())
+
+    def test_401_then_refresh_then_single_retry_succeeds(self):
+        self._write_creds({"refreshToken": "old-refresh", "expiresAt": int(cq.time.time() * 1000) + 999999})
+
+        cq.post_oauth_refresh = lambda rt: {"access_token": "refreshed-token"}
+
+        calls = []
+
+        def fake_fetch(token):
+            calls.append(token)
+            if len(calls) == 1:
+                raise cq.FetchError("HTTP 401", status_code=401)
+            return {
+                "five_hour": {"utilization": 30, "resets_at": "x"},
+                "seven_day": {"utilization": 40, "resets_at": "y"},
+            }
+
+        cq.fetch_usage_payload = fake_fetch
+
+        result = cq.poll_once(self.data_path)
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["stale"])
+        self.assertEqual(calls, ["fake-token-xyz", "refreshed-token"])
+        self.assertEqual(result["five_hour"]["utilization"], 30.0)
+
+    def test_401_then_refresh_fails_no_retry_loop(self):
+        self._write_creds({"refreshToken": "old-refresh", "expiresAt": int(cq.time.time() * 1000) + 999999})
+
+        def boom_refresh(rt):
+            raise cq.FetchError(
+                "token refresh failed (HTTP 400) — open Claude Code and run /login"
+            )
+
+        cq.post_oauth_refresh = boom_refresh
+
+        calls = []
+
+        def fake_fetch(token):
+            calls.append(token)
+            raise cq.FetchError("HTTP 401", status_code=401)
+
+        cq.fetch_usage_payload = fake_fetch
+
+        result = cq.poll_once(self.data_path)
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["stale"])
+        self.assertIn("token refresh failed", result["error"])
+        self.assertIn("/login", result["error"])
+        # exactly one usage call: the initial 401, no retry after a failed refresh
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("fake-token-xyz", json.dumps(result))
+        self.assertNotIn("old-refresh", json.dumps(result))
+
+    def test_no_refresh_env_disables_refresh_on_401(self):
+        self._write_creds({"refreshToken": "old-refresh", "expiresAt": int(cq.time.time() * 1000) + 999999})
+        cq.NO_REFRESH = True
+
+        refresh_called = []
+        cq.post_oauth_refresh = lambda rt: refresh_called.append(rt) or {"access_token": "should-not-be-used"}
+
+        calls = []
+
+        def fake_fetch(token):
+            calls.append(token)
+            raise cq.FetchError("HTTP 401", status_code=401)
+
+        cq.fetch_usage_payload = fake_fetch
+
+        result = cq.poll_once(self.data_path)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(refresh_called, [])
+        self.assertEqual(len(calls), 1)
+        self.assertIn("401", result["error"])
+        self.assertIn("CLAUDE_QUOTA_NO_REFRESH", result["error"])
+
+    def test_refresh_never_leaks_token_text_in_error(self):
+        self._write_creds({"refreshToken": "super-secret-refresh-token", "expiresAt": int(cq.time.time() * 1000) + 999999})
+
+        def boom_refresh(rt):
+            # simulate the flow function itself failing after seeing the token
+            raise cq.FetchError("token refresh failed (HTTP 400) — open Claude Code and run /login")
+
+        cq.post_oauth_refresh = boom_refresh
+
+        def fake_fetch(token):
+            raise cq.FetchError("HTTP 401", status_code=401)
+
+        cq.fetch_usage_payload = fake_fetch
+
+        result = cq.poll_once(self.data_path)
+        dumped = json.dumps(result)
+        self.assertNotIn("super-secret-refresh-token", dumped)
+        self.assertNotIn("fake-token-xyz", dumped)
+
+
+class TokenRefreshWriteBackTests(unittest.TestCase):
+    """Direct tests of refresh_token_flow's credentials-file write-back
+    behavior: backup creation, field preservation, partial responses."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.creds_path = Path(self.tmpdir.name) / ".credentials.json"
+
+        self._orig_post_refresh = cq.post_oauth_refresh
+        self.addCleanup(setattr, cq, "post_oauth_refresh", self._orig_post_refresh)
+
+    def _write_creds(self, oauth, extra_top_level=None):
+        content = {"claudeAiOauth": oauth}
+        content.update(extra_top_level or {})
+        self.creds_path.write_text(json.dumps(content), encoding="utf-8")
+
+    def test_backup_created_and_fields_updated_others_preserved(self):
+        self._write_creds(
+            oauth={
+                "accessToken": "old-access",
+                "refreshToken": "old-refresh",
+                "expiresAt": 1000,
+                "scopes": ["user:inference"],
+                "subscriptionType": "pro",
+            },
+            extra_top_level={"otherTopLevelKey": {"nested": True}},
+        )
+
+        cq.post_oauth_refresh = lambda rt: {
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "expires_in": 7200,
+        }
+
+        before_ms = int(cq.time.time() * 1000)
+        new_token = cq.refresh_token_flow(self.creds_path)
+        after_ms = int(cq.time.time() * 1000)
+
+        self.assertEqual(new_token, "new-access")
+
+        backup_path = self.creds_path.with_name(self.creds_path.name + ".claude-quota.bak")
+        self.assertTrue(backup_path.exists())
+        backup_data = json.loads(backup_path.read_text(encoding="utf-8"))
+        self.assertEqual(backup_data["claudeAiOauth"]["accessToken"], "old-access")
+
+        updated = json.loads(self.creds_path.read_text(encoding="utf-8"))
+        self.assertEqual(updated["claudeAiOauth"]["accessToken"], "new-access")
+        self.assertEqual(updated["claudeAiOauth"]["refreshToken"], "new-refresh")
+        self.assertGreaterEqual(updated["claudeAiOauth"]["expiresAt"], before_ms + 7200 * 1000)
+        self.assertLessEqual(updated["claudeAiOauth"]["expiresAt"], after_ms + 7200 * 1000)
+
+        # unrelated keys preserved byte-for-byte-equivalent
+        self.assertEqual(updated["claudeAiOauth"]["scopes"], ["user:inference"])
+        self.assertEqual(updated["claudeAiOauth"]["subscriptionType"], "pro")
+        self.assertEqual(updated["otherTopLevelKey"], {"nested": True})
+
+    def test_backup_overwritten_each_call(self):
+        self._write_creds(oauth={"accessToken": "v1", "refreshToken": "r1"})
+        cq.post_oauth_refresh = lambda rt: {"access_token": "v2", "refresh_token": "r2"}
+        cq.refresh_token_flow(self.creds_path)
+
+        cq.post_oauth_refresh = lambda rt: {"access_token": "v3", "refresh_token": "r3"}
+        cq.refresh_token_flow(self.creds_path)
+
+        backup_path = self.creds_path.with_name(self.creds_path.name + ".claude-quota.bak")
+        backup_data = json.loads(backup_path.read_text(encoding="utf-8"))
+        # the backup reflects the state right before the *second* refresh,
+        # i.e. the (v2, r2) creds, not the original (v1, r1)
+        self.assertEqual(backup_data["claudeAiOauth"]["accessToken"], "v2")
+
+    def test_response_without_new_refresh_token_or_expires_in_keeps_old_values(self):
+        self._write_creds(
+            oauth={"accessToken": "old-access", "refreshToken": "old-refresh", "expiresAt": 12345}
+        )
+        cq.post_oauth_refresh = lambda rt: {"access_token": "new-access-only"}
+
+        new_token = cq.refresh_token_flow(self.creds_path)
+
+        self.assertEqual(new_token, "new-access-only")
+        updated = json.loads(self.creds_path.read_text(encoding="utf-8"))
+        self.assertEqual(updated["claudeAiOauth"]["accessToken"], "new-access-only")
+        self.assertEqual(updated["claudeAiOauth"]["refreshToken"], "old-refresh")
+        self.assertEqual(updated["claudeAiOauth"]["expiresAt"], 12345)
+
+    def test_missing_refresh_token_raises_actionable_error_no_network_call(self):
+        self._write_creds(oauth={"accessToken": "old-access"})  # no refreshToken
+
+        called = []
+        cq.post_oauth_refresh = lambda rt: called.append(rt) or {"access_token": "x"}
+
+        with self.assertRaises(cq.FetchError) as ctx:
+            cq.refresh_token_flow(self.creds_path)
+
+        self.assertEqual(called, [])
+        self.assertIn("/login", str(ctx.exception))
+
+    def test_refresh_request_failure_is_actionable_and_token_free(self):
+        self._write_creds(oauth={"accessToken": "old-access", "refreshToken": "top-secret-rt"})
+
+        def boom(rt):
+            raise cq.FetchError("token refresh failed (HTTP 400) — open Claude Code and run /login")
+
+        cq.post_oauth_refresh = boom
+
+        with self.assertRaises(cq.FetchError) as ctx:
+            cq.refresh_token_flow(self.creds_path)
+
+        message = str(ctx.exception)
+        self.assertIn("/login", message)
+        self.assertNotIn("top-secret-rt", message)
+
+        # credentials file must be untouched on failure (no backup, no write)
+        backup_path = self.creds_path.with_name(self.creds_path.name + ".claude-quota.bak")
+        self.assertFalse(backup_path.exists())
+        unchanged = json.loads(self.creds_path.read_text(encoding="utf-8"))
+        self.assertEqual(unchanged["claudeAiOauth"]["accessToken"], "old-access")
+
+    def test_malformed_response_missing_access_token_raises_actionable_error(self):
+        self._write_creds(oauth={"accessToken": "old-access", "refreshToken": "rt"})
+        cq.post_oauth_refresh = lambda rt: {"refresh_token": "new-refresh"}  # no access_token
+
+        with self.assertRaises(cq.FetchError) as ctx:
+            cq.refresh_token_flow(self.creds_path)
+        self.assertIn("/login", str(ctx.exception))
+
 
 class HttpServerTests(unittest.TestCase):
     def setUp(self):
@@ -387,6 +662,41 @@ class HttpServerTests(unittest.TestCase):
         parsed = json.loads(body.decode("utf-8"))
         self.assertFalse(parsed["ok"])
         self.assertTrue(parsed["stale"])
+
+
+class LogFileTruncationTests(unittest.TestCase):
+    """_configure_file_logging should truncate collector.log before attaching
+    the handler if it's grown past 1 MB, and otherwise append."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.log_path = Path(self.tmpdir.name) / "collector.log"
+
+        self._orig_log_path = cq.LOG_PATH
+        cq.LOG_PATH = self.log_path
+        self.addCleanup(setattr, cq, "LOG_PATH", self._orig_log_path)
+
+        self._root_logger = cq.logging.getLogger()
+        self._orig_handlers = list(self._root_logger.handlers)
+        self.addCleanup(self._restore_handlers)
+
+    def _restore_handlers(self):
+        for handler in list(self._root_logger.handlers):
+            if handler not in self._orig_handlers:
+                self._root_logger.removeHandler(handler)
+                handler.close()
+
+    def test_oversized_log_is_truncated_before_attaching_handler(self):
+        self.log_path.write_text("x" * (cq._MAX_LOG_BYTES + 1000), encoding="utf-8")
+        cq._configure_file_logging()
+        self.assertLess(self.log_path.stat().st_size, 1000)
+
+    def test_small_log_is_not_truncated(self):
+        self.log_path.write_text("existing log line\n", encoding="utf-8")
+        cq._configure_file_logging()
+        content = self.log_path.read_text(encoding="utf-8")
+        self.assertIn("existing log line", content)
 
 
 class PollSecondsFloorTests(unittest.TestCase):

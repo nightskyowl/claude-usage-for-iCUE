@@ -17,6 +17,13 @@ progress bars with percentage and reset time.
      (ISO 8601) for both windows.
    - **Polls no more often than every 15 minutes** (endpoint is aggressively rate limited).
    - On any failure, keeps serving the last good result (adds `stale: true`).
+   - **Auto-refreshes the OAuth token** (user-approved): if the access token is expired or
+     the API returns 401, it POSTs the refresh token to
+     `https://console.anthropic.com/v1/oauth/token` (Claude Code's public client id),
+     backs up the credentials file to `.credentials.json.claude-quota.bak`, then atomically
+     writes back only `accessToken`/`refreshToken`/`expiresAt`. At most one refresh + one
+     usage retry per cycle. Disable with `CLAUDE_QUOTA_NO_REFRESH=1`.
+   - Logs to `collector/collector.log` (truncated at 1 MB); exits if port already bound.
 2. **Localhost HTTP server** (same Python process) — serves `data/latest.json` at
    `http://127.0.0.1:8765/latest.json` with `Access-Control-Allow-Origin: *`.
 3. **Widget** (`widget/ClaudeQuota/`) — pure renderer. Fetches only the localhost JSON.

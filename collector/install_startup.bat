@@ -1,6 +1,9 @@
 @echo off
 REM Registers the Claude Quota collector to start automatically at logon
 REM using the Windows Task Scheduler (no admin rights required: /RL LIMITED).
+REM The collector auto-refreshes its OAuth token (see CLAUDE.md) and logs to
+REM collector.log in this folder; use restart_collector.bat to bounce it
+REM manually (e.g. after an update or if the port is already in use).
 setlocal
 set "SCRIPT_DIR=%~dp0"
 set "SCRIPT_PATH=%SCRIPT_DIR%claude_quota.py"

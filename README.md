@@ -47,6 +47,16 @@ icuewidget package widget/ClaudeQuota
 
 Built with the official [Corsair iCUE Widget Builder skill](https://github.com/Corsair-Labs/icue-widget-builder).
 
+## Troubleshooting
+
+- **Widget shows `--%` / "Collector offline"** — the collector isn't running or the port
+  is taken. Run `collector/restart_collector.bat` and check `collector/collector.log`.
+- **`data/latest.json` says `HTTP 401`** — the access token expired. The collector now
+  refreshes it automatically (backing up `.credentials.json` first). If refresh fails,
+  open Claude Code and run `/login`, then `restart_collector.bat`.
+- **Percentages look ~100× too low** — set `CLAUDE_QUOTA_ASSUME_FRACTION=1`.
+- Disable automatic token refresh with `CLAUDE_QUOTA_NO_REFRESH=1`.
+
 ## Security
 
 - Your OAuth token never leaves your machine except to `api.anthropic.com` over HTTPS.

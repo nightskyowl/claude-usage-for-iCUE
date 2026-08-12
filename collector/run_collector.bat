@@ -11,4 +11,6 @@ if %ERRORLEVEL%==0 (
     python "%~dp0claude_quota.py"
 )
 
+echo log: collector.log
+
 endlocal
