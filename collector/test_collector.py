@@ -894,6 +894,57 @@ class HttpServerTests(unittest.TestCase):
         self.assertTrue(parsed["stale"])
 
 
+class QuotaServerSingleInstanceGuardTests(unittest.TestCase):
+    """Regression tests for the Windows double-bind bug: two collector
+    processes both bound 127.0.0.1:8765 simultaneously because
+    http.server.HTTPServer's allow_reuse_address = 1 maps to SO_REUSEADDR,
+    which on Windows (unlike POSIX) permits two unrelated sockets to bind
+    the exact same address/port. make_server() now returns a QuotaServer
+    whose allow_reuse_address is platform-dependent (False on win32), so a
+    second instance's bind() raises OSError and the existing port-in-use
+    guard in main() fires."""
+
+    def test_make_server_returns_quota_server(self):
+        httpd = cq.make_server(port=0)
+        try:
+            self.assertIsInstance(httpd, cq.QuotaServer)
+        finally:
+            httpd.server_close()
+
+    def test_allow_reuse_address_false_on_win32(self):
+        self.assertFalse(cq._allow_reuse_address_for_platform("win32"))
+
+    def test_allow_reuse_address_true_on_linux(self):
+        self.assertTrue(cq._allow_reuse_address_for_platform("linux"))
+
+    def test_allow_reuse_address_true_on_darwin(self):
+        self.assertTrue(cq._allow_reuse_address_for_platform("darwin"))
+
+    def test_quota_server_class_attribute_matches_running_platform(self):
+        # Sanity check that the class attribute (evaluated once at class
+        # definition time from sys.platform) is consistent with the helper.
+        expected = cq._allow_reuse_address_for_platform(sys.platform)
+        self.assertEqual(cq.QuotaServer.allow_reuse_address, expected)
+
+    def test_second_instance_on_same_port_raises_oserror(self):
+        # This is the behavior the port-in-use guard in main() depends on.
+        # On POSIX (where this suite runs), allow_reuse_address is True,
+        # which only permits rebinding a socket stuck in TIME_WAIT -- it
+        # does not allow two simultaneously *live* listeners on the same
+        # port, so this already proves the guard path works today. The
+        # win32-specific behavior is covered by the allow_reuse_address
+        # helper tests above, since we can't flip sys.platform at runtime
+        # and have the QuotaServer class attribute (bound at class
+        # definition time) pick it up.
+        first = cq.make_server(port=0)
+        self.addCleanup(first.server_close)
+        port = first.server_address[1]
+
+        with self.assertRaises(OSError):
+            second = cq.make_server(port=port)
+            second.server_close()
+
+
 class LogFileTruncationTests(unittest.TestCase):
     """_configure_file_logging should truncate collector.log before attaching
     the handler if it's grown past 1 MB, and otherwise append."""

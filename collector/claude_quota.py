@@ -20,6 +20,7 @@ import logging
 import os
 import platform
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -918,9 +919,35 @@ class QuotaRequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
 
-def make_server(port: int = None) -> ThreadingHTTPServer:
+def _allow_reuse_address_for_platform(plat: str) -> bool:
+    """SO_REUSEADDR (which http.server enables via allow_reuse_address = 1)
+    means "allow a quick restart to rebind a socket still in TIME_WAIT" on
+    POSIX. On Windows, SO_REUSEADDR instead permits two unrelated processes
+    to bind the *same* address/port simultaneously, which silently defeats
+    our single-instance port guard (two collectors both bind 127.0.0.1:8765
+    and both poll the rate-limited API). So: keep the POSIX quick-restart
+    behavior, but disable it on win32 so a second instance's bind() raises
+    OSError like main() expects."""
+    return plat != "win32"
+
+
+class QuotaServer(ThreadingHTTPServer):
+    # Evaluated once at class definition time -- see
+    # _allow_reuse_address_for_platform for why this differs on Windows.
+    allow_reuse_address = _allow_reuse_address_for_platform(sys.platform)
+
+    def server_bind(self) -> None:
+        # Belt-and-braces on top of allow_reuse_address = False: explicitly
+        # request exclusive binding on Windows, where SO_REUSEADDR semantics
+        # otherwise allow two processes to double-bind the same port.
+        if sys.platform == "win32" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
+def make_server(port: int = None) -> QuotaServer:
     port = PORT if port is None else port
-    return ThreadingHTTPServer(("127.0.0.1", port), QuotaRequestHandler)
+    return QuotaServer(("127.0.0.1", port), QuotaRequestHandler)
 
 
 # --------------------------------------------------------------------------
