@@ -1088,6 +1088,48 @@ def _diag_scheduled_task() -> dict:
     return result
 
 
+def _diag_run_key() -> dict:
+    """Query the HKCU Run key for the "ClaudeQuotaCollector" no-admin
+    autostart fallback registered by install_startup.bat when Task
+    Scheduler needs admin rights (schtasks /Create fails with "Access is
+    denied"), via `reg query`. available:False on non-Windows or if the reg
+    invocation itself fails for any reason (missing binary, timeout, ...).
+    exists reflects whether reg found the value (returncode == 0); value is
+    the REG_SZ command line verbatim (quoted interpreter path + quoted
+    script path -- file paths only, safe to include) and stays None if the
+    output can't be parsed even though exists is still True."""
+    result: dict = {"available": False, "exists": False, "value": None}
+    if sys.platform != "win32":
+        return result
+
+    try:
+        proc = subprocess.run(
+            [
+                "reg", "query",
+                "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                "/v", "ClaudeQuotaCollector",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except Exception:  # noqa: BLE001 - diagnostics must never crash
+        return result
+
+    result["available"] = True
+    result["exists"] = proc.returncode == 0
+    if not result["exists"]:
+        return result
+
+    for line in (proc.stdout or "").splitlines():
+        if "ClaudeQuotaCollector" in line and "REG_SZ" in line:
+            _, _, value = line.partition("REG_SZ")
+            result["value"] = value.strip()
+            break
+
+    return result
+
+
 def _diag_collector_process() -> dict:
     """Check whether a collector process (`python.../claude_quota.py`, no
     server mode) is currently running, via a PowerShell Win32_Process query.
@@ -1201,6 +1243,7 @@ def build_diag(creds_path: Path = None) -> dict:
         "credentials_file": _diag_credentials_file(creds_path),
         "credential_manager": _diag_credential_manager(),
         "scheduled_task": _diag_scheduled_task(),
+        "run_key": _diag_run_key(),
         "collector_process": _diag_collector_process(),
     }
 

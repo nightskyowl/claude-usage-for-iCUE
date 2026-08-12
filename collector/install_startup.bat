@@ -1,7 +1,10 @@
 @echo off
-REM Registers the Claude Quota collector to start automatically at logon
-REM using the Windows Task Scheduler (no admin rights required: /RL LIMITED).
-REM The collector auto-refreshes its OAuth token (see CLAUDE.md) and logs to
+REM Registers the Claude Quota collector to start automatically at logon.
+REM Tries the Windows Task Scheduler first (/RL LIMITED asks for no-admin
+REM rights, but some machines still refuse ONLOGON task creation with
+REM "Access is denied"); if that fails, falls back to a per-user
+REM HKCU...\Run registry value, which never needs admin rights. The
+REM collector auto-refreshes its OAuth token (see CLAUDE.md) and logs to
 REM collector.log in this folder; use restart_collector.bat to bounce it
 REM manually (e.g. after an update or if the port is already in use).
 REM
@@ -46,14 +49,27 @@ if not defined PYTHON_FULL_PATH (
 
 echo Registering collector with interpreter: %PYTHON_FULL_PATH%
 
-schtasks /Create /TN "ClaudeQuotaCollector" /TR "\"%PYTHON_FULL_PATH%\" \"%SCRIPT_PATH%\"" /SC ONLOGON /RL LIMITED /F
-if %ERRORLEVEL% NEQ 0 (
-    echo Failed to create scheduled task.
-    pause
-    exit /b 1
+schtasks /Create /TN "ClaudeQuotaCollector" /TR "\"%PYTHON_FULL_PATH%\" \"%SCRIPT_PATH%\"" /SC ONLOGON /RL LIMITED /F 2>nul
+if not errorlevel 1 (
+    echo Registered autostart via Task Scheduler.
+    goto :registered
 )
 
-schtasks /Run /TN "ClaudeQuotaCollector"
+echo Task Scheduler needs admin rights - using the per-user Run key instead.
 
-echo Claude Quota collector installed and started (runs at logon).
+reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v ClaudeQuotaCollector /t REG_SZ /d "\"%PYTHON_FULL_PATH%\" \"%SCRIPT_PATH%\"" /f
+if not errorlevel 1 (
+    echo Registered autostart via registry Run key.
+    goto :registered
+)
+
+echo.
+echo Could not register autostart via Task Scheduler or the registry Run key.
+echo.
+pause
+exit /b 1
+
+:registered
+start "" "%PYTHON_FULL_PATH%" "%SCRIPT_PATH%"
+echo Collector started now. Log: %SCRIPT_DIR%collector.log
 endlocal

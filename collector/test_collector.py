@@ -1143,6 +1143,14 @@ class DiagModeTests(unittest.TestCase):
         for key in ("available", "running", "pids"):
             self.assertIn(key, diag["collector_process"])
 
+    def test_diag_includes_run_key_section(self):
+        # Same idea as the scheduled_task/collector_process check above, for
+        # the no-admin HKCU Run key autostart fallback.
+        diag = cq.build_diag()
+        self.assertIn("run_key", diag)
+        for key in ("available", "exists", "value"):
+            self.assertIn(key, diag["run_key"])
+
 
 class DiagCliInvocationTests(unittest.TestCase):
     """--diag via sys.argv must not start the server/poller and must exit
@@ -1441,6 +1449,94 @@ class ScheduledTaskAndCollectorProcessDiagTests(unittest.TestCase):
         self.assertTrue(result["available"])
         self.assertFalse(result["running"])
         self.assertEqual(result["pids"], [])
+
+    # -- _diag_run_key(): HKCU Run key no-admin autostart fallback ---------
+
+    _REG_QUERY_OUTPUT_FOUND = (
+        "\n"
+        "HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\n"
+        "    ClaudeQuotaCollector    REG_SZ    "
+        "\"C:\\Users\\user\\AppData\\Local\\Programs\\Python\\Python311\\"
+        "pythonw.exe\" \"C:\\path\\to\\claude_quota.py\"\n"
+        "\n"
+    )
+
+    def test_run_key_available_false_on_non_windows(self):
+        if sys.platform == "win32":
+            self.skipTest("this assertion targets non-Windows behavior")
+        result = cq._diag_run_key()
+        self.assertEqual(
+            result, {"available": False, "exists": False, "value": None}
+        )
+
+    def test_diag_run_key_never_raises_when_reg_missing(self):
+        orig_run = cq.subprocess.run
+        orig_platform = cq.sys.platform
+
+        def _boom(*args, **kwargs):
+            raise FileNotFoundError("reg not found")
+
+        cq.subprocess.run = _boom
+        cq.sys.platform = "win32"
+        try:
+            result = cq._diag_run_key()
+        finally:
+            cq.subprocess.run = orig_run
+            cq.sys.platform = orig_platform
+
+        self.assertFalse(result["available"])
+        self.assertFalse(result["exists"])
+        self.assertIsNone(result["value"])
+
+    def test_diag_run_key_parses_mocked_reg_query_output(self):
+        import types
+
+        orig_run = cq.subprocess.run
+        orig_platform = cq.sys.platform
+
+        def _fake_run(*args, **kwargs):
+            return types.SimpleNamespace(
+                returncode=0, stdout=self._REG_QUERY_OUTPUT_FOUND, stderr=""
+            )
+
+        cq.subprocess.run = _fake_run
+        cq.sys.platform = "win32"
+        try:
+            result = cq._diag_run_key()
+        finally:
+            cq.subprocess.run = orig_run
+            cq.sys.platform = orig_platform
+
+        self.assertTrue(result["available"])
+        self.assertTrue(result["exists"])
+        self.assertIn("pythonw.exe", result["value"])
+        self.assertIn("claude_quota.py", result["value"])
+
+    def test_diag_run_key_not_found_sets_exists_false(self):
+        import types
+
+        orig_run = cq.subprocess.run
+        orig_platform = cq.sys.platform
+
+        def _fake_run(*args, **kwargs):
+            return types.SimpleNamespace(
+                returncode=1,
+                stdout="ERROR: The system was unable to find the specified "
+                "registry key or value.\n",
+                stderr="",
+            )
+
+        cq.subprocess.run = _fake_run
+        cq.sys.platform = "win32"
+        try:
+            result = cq._diag_run_key()
+        finally:
+            cq.subprocess.run = orig_run
+            cq.sys.platform = orig_platform
+
+        self.assertTrue(result["available"])
+        self.assertFalse(result["exists"])
+        self.assertIsNone(result["value"])
 
 
 class RateLimit429Tests(unittest.TestCase):
