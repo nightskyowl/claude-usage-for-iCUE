@@ -74,15 +74,20 @@
 
     // Refresh cadence is a constant, not a user setting — localhost fetches are cheap.
     var REFRESH_INTERVAL_MS = 60000;
+    // Fast retry cadence used at logon (before the collector is up) and whenever the
+    // last fetch failed — avoids sitting on "Collector offline" for a full 60s.
+    var FAST_RETRY_MS = 5000;
 
     var languageCode = 'en';
     var currentPort = '8765';
     var pollingStarted = false;
     var firstFetchDone = false;
+    var hasLoadedOnce = false; // true once any fetch has ever succeeded in this session
     var lastGoodData = null; // { five_hour: {utilization, resets_at}, seven_day: {...} }
     var isOffline = false;
     var isStaleFlag = false;
     var fetchTimer = null;
+    var fetchInFlight = false;
     var resetsTemplate = 'Resets {value}';
 
     // English fallback dictionary — used outside iCUE (plain browser preview)
@@ -260,6 +265,9 @@
 
     // --- Data fetch: pure renderer — the ONLY network call this widget ever makes. ---
     function fetchQuota() {
+      if (fetchInFlight) return; // guard against overlapping fetches
+      fetchInFlight = true;
+
       var port = getIcueProperty('serverPort');
       port = (typeof port === 'string' && port.trim()) ? port.trim() : '8765';
       var url = 'http://127.0.0.1:' + port + '/latest.json';
@@ -271,6 +279,7 @@
         })
         .then(function (data) {
           setOffline(false);
+          hasLoadedOnce = true;
           if (data && typeof data === 'object') {
             var hasWindows = data.five_hour || data.seven_day;
             if (hasWindows) lastGoodData = data;
@@ -282,21 +291,25 @@
         })
         .then(function () {
           firstFetchDone = true;
+          fetchInFlight = false;
           showState('content');
           renderRows();
+          scheduleRefresh();
         });
     }
 
+    // setTimeout chaining (not setInterval): schedules the NEXT fetch only after the
+    // current one settles, at FAST_RETRY_MS until the first success, then REFRESH_INTERVAL_MS.
     function scheduleRefresh() {
-      if (fetchTimer) clearInterval(fetchTimer);
-      fetchTimer = setInterval(fetchQuota, REFRESH_INTERVAL_MS);
+      if (fetchTimer) { clearTimeout(fetchTimer); fetchTimer = null; }
+      var delay = (!hasLoadedOnce || isOffline) ? FAST_RETRY_MS : REFRESH_INTERVAL_MS;
+      fetchTimer = setTimeout(fetchQuota, delay);
     }
 
     function startPolling() {
       if (pollingStarted) return;
       pollingStarted = true;
       fetchQuota();
-      scheduleRefresh();
     }
 
     function onIcueDataUpdated() {
@@ -306,7 +319,10 @@
       newPort = (typeof newPort === 'string' && newPort.trim()) ? newPort.trim() : '8765';
       if (newPort !== currentPort) {
         currentPort = newPort;
-        if (pollingStarted) fetchQuota();
+        if (pollingStarted) {
+          if (fetchTimer) { clearTimeout(fetchTimer); fetchTimer = null; }
+          fetchQuota();
+        }
       }
     }
 
