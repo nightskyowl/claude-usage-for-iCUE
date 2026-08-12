@@ -3,7 +3,7 @@
   "id": "com.sir.claudequota",
   "name": "Claude Quota",
   "description": "Anthropic Claude plan quota: 5-hour and weekly windows",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "preview_icon": "resources/icon.svg",
   "min_app_version": "5.46",
   "min_framework_version": "1.0.0",

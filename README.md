@@ -12,6 +12,7 @@ percentage and reset time. Green below 70 %, amber 70–90 %, red above 90 %.
 [Claude credentials file] → collector (poll ≤ 1/15 min) → data/latest.json
                                                              │
                           widget (pure renderer) ← localhost:8765/latest.json
+                                  (re-reads every 5 s)
 ```
 
 - **Collector + server** — `collector/claude_quota.py` (Python 3, stdlib only). Reads your
@@ -20,6 +21,19 @@ percentage and reset time. Green below 70 %, amber 70–90 %, red above 90 %.
   `http://127.0.0.1:8765/latest.json`.
 - **Widget** — `widget/ClaudeQuota/`. Renders the cached JSON. It holds no tokens and
   never talks to Anthropic.
+
+### Freshness
+
+The 15-minute cadence is set by Anthropic's usage endpoint, which rate-limits aggressively —
+it is not a display limitation. Two things keep the display closer to reality without
+raising the sustained request rate:
+
+- The widget re-reads `latest.json` every **5 seconds**. That traffic never leaves your
+  machine, so new collector data appears almost immediately rather than up to a minute later.
+- The collector is **reset-aware**: when a usage window's `resets_at` falls sooner than the
+  next scheduled poll, it polls just after that boundary instead. Without this, a window that
+  emptied could keep displaying its old near-100 % figure for another full interval. This
+  costs at most one extra request per rollover — a handful per day.
 
 ## Requirements
 

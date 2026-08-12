@@ -803,7 +803,80 @@ def poll_once(path: Path = None) -> dict:
         return normalized
 
 
-def next_poll_delay(status_kind: str) -> int:
+# --------------------------------------------------------------------------
+# Reset-aware scheduling
+# --------------------------------------------------------------------------
+#
+# POLL_SECONDS is tuned for an aggressively rate-limited endpoint, but a fixed
+# cadence produces one visibly wrong state: when a usage window rolls over, the
+# widget keeps showing the pre-reset utilization for up to a full poll interval
+# even though the real figure has just dropped to ~0. So when a window's
+# advertised resets_at falls sooner than the next scheduled poll, we poll just
+# after that boundary instead.
+#
+# This does NOT raise the sustained request rate: it adds at most one extra
+# poll per window rollover (a handful per day), because the post-reset response
+# carries a resets_at ~5h/7d in the future, which puts the cadence straight
+# back to POLL_SECONDS.
+
+# Wait this long past resets_at before re-polling — the server may not have
+# rolled the window over at the exact instant it advertises.
+_RESET_GRACE_SECONDS = 15
+# Floor for a reset-aware poll, so a stale or past resets_at can never spin the
+# poller into a tight request loop.
+_MIN_RESET_POLL_SECONDS = 60
+
+
+def _parse_reset_at(value: Any) -> Optional[datetime]:
+    """Parse an ISO-8601 resets_at into an aware UTC datetime, or None if it is
+    missing/unparseable. Tolerates a trailing 'Z' (fromisoformat only accepts
+    it natively on 3.11+) and naive timestamps (assumed UTC).
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text[-1] in ("Z", "z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def seconds_until_next_reset(
+    data: Any, now: Optional[datetime] = None
+) -> Optional[int]:
+    """Seconds until the soonest still-future window reset in `data`, or None
+    when no window advertises a parseable future resets_at.
+
+    Pure and side-effect free (`now` is injectable) so it stays unit-testable
+    without freezing the clock.
+    """
+    if not isinstance(data, dict):
+        return None
+    now = now or datetime.now(timezone.utc)
+    soonest: Optional[float] = None
+    for key in ("five_hour", "seven_day"):
+        window = data.get(key)
+        if not isinstance(window, dict):
+            continue
+        parsed = _parse_reset_at(window.get("resets_at"))
+        if parsed is None:
+            continue
+        delta = (parsed - now).total_seconds()
+        if delta <= 0:
+            continue
+        if soonest is None or delta < soonest:
+            soonest = delta
+    return None if soonest is None else int(soonest)
+
+
+def next_poll_delay(
+    status_kind: str, data: Any = None, now: Optional[datetime] = None
+) -> int:
     """Compute the delay (seconds) before the next poll cycle, given the
     outcome kind ("ok" | "429" | "auth" | "other") of the poll cycle that
     just ran.
@@ -811,6 +884,12 @@ def next_poll_delay(status_kind: str) -> int:
     Consecutive 429s back off exponentially: min(POLL_SECONDS *
     2**consecutive_429s, _MAX_BACKOFF_SECONDS). Any non-429 outcome resets
     the counter and returns the normal POLL_SECONDS interval.
+
+    On a successful cycle, `data` (the freshly written payload) is consulted so
+    the next poll can be pulled forward to just after an imminent window reset
+    -- never pushed out, and never below _MIN_RESET_POLL_SECONDS. Backoff and
+    auth-latch cycles ignore it entirely: a rate-limited or unauthenticated
+    collector must not be dragged back into polling by a reset boundary.
     """
     global _consecutive_429s
     if status_kind == "429":
@@ -820,7 +899,21 @@ def next_poll_delay(status_kind: str) -> int:
             log.info("backing off: next poll in %d minutes", delay // 60)
         return delay
     _consecutive_429s = 0
-    return POLL_SECONDS
+    if status_kind != "ok":
+        return POLL_SECONDS
+
+    until_reset = seconds_until_next_reset(data, now)
+    if until_reset is None:
+        return POLL_SECONDS
+    candidate = max(until_reset + _RESET_GRACE_SECONDS, _MIN_RESET_POLL_SECONDS)
+    if candidate >= POLL_SECONDS:
+        return POLL_SECONDS
+    log.info(
+        "window resets in %ds; pulling next poll forward to %ds",
+        until_reset,
+        candidate,
+    )
+    return candidate
 
 
 def initial_poll_delay(path: Path = None) -> int:
@@ -867,8 +960,8 @@ def poller_loop(stop_event: threading.Event) -> None:
             return
 
     while not stop_event.is_set():
-        poll_once()
-        delay = next_poll_delay(_last_poll_status)
+        result = poll_once()
+        delay = next_poll_delay(_last_poll_status, result)
         if stop_event.wait(delay):
             break
 

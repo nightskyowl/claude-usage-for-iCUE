@@ -16,6 +16,15 @@ progress bars with percentage and reset time.
    - Writes normalized `data/latest.json` with `utilization` (0–100) and `resets_at`
      (ISO 8601) for both windows.
    - **Polls no more often than every 15 minutes** (endpoint is aggressively rate limited).
+     `_MIN_POLL_SECONDS = 900` is a **hard floor**: `CLAUDE_QUOTA_POLL_SECONDS` below it is
+     warned about and clamped, so setting it to e.g. 60 silently has no effect.
+   - **Reset-aware scheduling**: on a successful cycle the next poll is pulled forward to
+     just after the soonest upcoming `resets_at` (+15 s grace, floored at 60 s) when that
+     lands sooner than the normal interval. This fixes the one visibly-wrong state — a
+     window that has emptied still showing its pre-reset figure for a full interval. It only
+     ever *shortens* the wait, never extends it, and is ignored entirely during 429 backoff
+     and while the auth latch is active, so a rate-limited collector can't be dragged back
+     into polling by a reset boundary. Costs ≤1 extra request per rollover.
    - On any failure, keeps serving the last good result (adds `stale: true`).
    - **Auto-refreshes the OAuth token** (user-approved): if the access token is expired or
      the API returns 401, it POSTs the refresh token to
@@ -27,7 +36,9 @@ progress bars with percentage and reset time.
 2. **Localhost HTTP server** (same Python process) — serves `data/latest.json` at
    `http://127.0.0.1:8765/latest.json` with `Access-Control-Allow-Origin: *`.
 3. **Widget** (`widget/ClaudeQuota/`) — pure renderer. Fetches only the localhost JSON.
-   **Holds no tokens, never calls Anthropic directly.**
+   **Holds no tokens, never calls Anthropic directly.** Re-reads `latest.json` every
+   **5 s** (`REFRESH_INTERVAL_MS`); this is localhost-only traffic and adds zero API load,
+   so it is deliberately decoupled from the collector's 15-minute cadence.
 
 ## Security rules
 
@@ -58,6 +69,13 @@ progress bars with percentage and reset time.
 
 - **Verified live on 2026-08-12**: `/api/oauth/usage` returned `utilization` as plain
   percent (46.0, 8.0) with ISO `resets_at`. Percent-as-is normalization is correct.
+- **Observed live at a window rollover (2026-08-12 18:40 +0700)**: immediately after the
+  5-hour window reset, the endpoint returned `utilization: 0.0` with **`resets_at: null`** —
+  the next boundary only reappears once you use Claude again and the window restarts. So
+  `resets_at` is nullable *in the success path*, not just on failure. Anything reading it
+  must skip nulls rather than assume a timestamp: `seconds_until_next_reset()` ignores that
+  window (correctly falling back to the 7-day boundary and normal cadence), and the widget's
+  `formatResetLine()` returns `''`. Confirmed no tight-poll loop results.
 - **Token refresh endpoint** (`console.anthropic.com/v1/oauth/token`) sits behind
   Cloudflare: requests without a real `User-Agent` get **403**. Always send the same
   header set as the usage call (`User-Agent`, `Accept`, `anthropic-beta`).

@@ -10,6 +10,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -1909,6 +1910,169 @@ class NextPollDelayTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             with self.assertLogs(cq.log, level="INFO"):
                 cq.next_poll_delay("ok")
+
+
+_NOW = datetime(2026, 8, 12, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def _payload(**windows):
+    """Build a minimal normalized payload carrying only resets_at values."""
+    return {
+        key: {"utilization": 50.0, "resets_at": value}
+        for key, value in windows.items()
+    }
+
+
+class ParseResetAtTests(unittest.TestCase):
+    """_parse_reset_at(): tolerant ISO-8601 parsing, always aware UTC."""
+
+    def test_parses_offset_form_the_api_actually_returns(self):
+        parsed = cq._parse_reset_at("2026-08-12T11:39:59.948947+00:00")
+        self.assertEqual(parsed, datetime(2026, 8, 12, 11, 39, 59, 948947, tzinfo=timezone.utc))
+
+    def test_parses_trailing_z(self):
+        # fromisoformat only accepts 'Z' natively on 3.11+; we normalize it.
+        self.assertEqual(
+            cq._parse_reset_at("2026-08-12T11:39:59Z"),
+            datetime(2026, 8, 12, 11, 39, 59, tzinfo=timezone.utc),
+        )
+
+    def test_naive_timestamp_is_assumed_utc(self):
+        self.assertEqual(
+            cq._parse_reset_at("2026-08-12T11:39:59"),
+            datetime(2026, 8, 12, 11, 39, 59, tzinfo=timezone.utc),
+        )
+
+    def test_non_utc_offset_is_converted(self):
+        self.assertEqual(
+            cq._parse_reset_at("2026-08-12T18:39:59+07:00"),
+            datetime(2026, 8, 12, 11, 39, 59, tzinfo=timezone.utc),
+        )
+
+    def test_unparseable_and_missing_values_return_none(self):
+        for value in (None, "", "   ", "not-a-date", 12345, [], {}):
+            with self.subTest(value=value):
+                self.assertIsNone(cq._parse_reset_at(value))
+
+
+class SecondsUntilNextResetTests(unittest.TestCase):
+    """seconds_until_next_reset(): soonest *future* reset across windows."""
+
+    def test_picks_soonest_future_window(self):
+        data = _payload(
+            five_hour=(_NOW + timedelta(minutes=10)).isoformat(),
+            seven_day=(_NOW + timedelta(days=3)).isoformat(),
+        )
+        self.assertEqual(cq.seconds_until_next_reset(data, _NOW), 600)
+
+    def test_seven_day_wins_when_it_is_sooner(self):
+        data = _payload(
+            five_hour=(_NOW + timedelta(hours=4)).isoformat(),
+            seven_day=(_NOW + timedelta(minutes=5)).isoformat(),
+        )
+        self.assertEqual(cq.seconds_until_next_reset(data, _NOW), 300)
+
+    def test_past_resets_are_ignored(self):
+        data = _payload(
+            five_hour=(_NOW - timedelta(minutes=30)).isoformat(),
+            seven_day=(_NOW + timedelta(minutes=20)).isoformat(),
+        )
+        self.assertEqual(cq.seconds_until_next_reset(data, _NOW), 1200)
+
+    def test_all_past_returns_none(self):
+        data = _payload(five_hour=(_NOW - timedelta(minutes=1)).isoformat())
+        self.assertIsNone(cq.seconds_until_next_reset(data, _NOW))
+
+    def test_missing_malformed_and_non_dict_inputs_return_none(self):
+        for data in (None, {}, "nope", 42, {"five_hour": None}, {"five_hour": "x"}):
+            with self.subTest(data=data):
+                self.assertIsNone(cq.seconds_until_next_reset(data, _NOW))
+
+    def test_failure_skeleton_without_resets_is_safe(self):
+        data = {"ok": False, "five_hour": {"utilization": None, "resets_at": None}}
+        self.assertIsNone(cq.seconds_until_next_reset(data, _NOW))
+
+    def test_post_rollover_payload_falls_back_to_the_other_window(self):
+        """Exact shape observed live at a 5h rollover (2026-08-12 18:40 +0700):
+        a *successful* poll can carry utilization 0.0 with resets_at None until
+        the window restarts. The null window must be skipped, not crash or
+        schedule a tight loop -- the 7-day boundary carries the cadence."""
+        data = {
+            "ok": True,
+            "five_hour": {"utilization": 0.0, "resets_at": None},
+            "seven_day": {
+                "utilization": 12.0,
+                "resets_at": (_NOW + timedelta(days=3)).isoformat(),
+            },
+        }
+        self.assertEqual(cq.seconds_until_next_reset(data, _NOW), 3 * 24 * 3600)
+        # ...and that distant boundary must leave the normal cadence alone.
+        self.assertEqual(cq.next_poll_delay("ok", data, _NOW), cq.POLL_SECONDS)
+
+
+class ResetAwarePollDelayTests(unittest.TestCase):
+    """next_poll_delay() pulls the next poll forward to just after an imminent
+    window reset -- but never pushes it out, never below the floor, and never
+    while backing off or auth-latched."""
+
+    def setUp(self):
+        self._orig_poll_seconds = cq.POLL_SECONDS
+        cq.POLL_SECONDS = 900
+        self.addCleanup(setattr, cq, "POLL_SECONDS", self._orig_poll_seconds)
+
+        self._orig_consecutive_429s = cq._consecutive_429s
+        cq._consecutive_429s = 0
+        self.addCleanup(setattr, cq, "_consecutive_429s", self._orig_consecutive_429s)
+
+    def _delay(self, status, seconds_ahead):
+        data = _payload(five_hour=(_NOW + timedelta(seconds=seconds_ahead)).isoformat())
+        return cq.next_poll_delay(status, data, _NOW)
+
+    def test_imminent_reset_pulls_poll_forward_with_grace(self):
+        # 200s to reset -> poll at 200 + _RESET_GRACE_SECONDS, well under 900.
+        self.assertEqual(self._delay("ok", 200), 200 + cq._RESET_GRACE_SECONDS)
+
+    def test_distant_reset_leaves_normal_cadence_untouched(self):
+        # A 5h window mid-cycle must never stretch the interval past POLL_SECONDS.
+        self.assertEqual(self._delay("ok", 4 * 3600), 900)
+
+    def test_reset_just_beyond_poll_interval_does_not_extend(self):
+        self.assertEqual(self._delay("ok", 1000), 900)
+
+    def test_very_near_reset_is_floored(self):
+        # Without the floor this would schedule a poll ~5s out.
+        self.assertEqual(self._delay("ok", 5), cq._MIN_RESET_POLL_SECONDS)
+
+    def test_backoff_ignores_imminent_reset(self):
+        # A rate-limited collector must not be dragged back in by a boundary.
+        self.assertEqual(self._delay("429", 30), 1800)
+
+    def test_auth_latch_ignores_imminent_reset(self):
+        self.assertEqual(self._delay("auth", 30), 900)
+
+    def test_other_failure_ignores_imminent_reset(self):
+        self.assertEqual(self._delay("other", 30), 900)
+
+    def test_no_data_falls_back_to_normal_interval(self):
+        self.assertEqual(cq.next_poll_delay("ok"), 900)
+
+    def test_logs_when_pulling_forward(self):
+        with self.assertLogs(cq.log, level="INFO") as ctx:
+            self._delay("ok", 200)
+        self.assertTrue(any("pulling next poll forward" in line for line in ctx.output))
+
+    def test_does_not_log_when_cadence_unchanged(self):
+        with self.assertRaises(AssertionError):
+            with self.assertLogs(cq.log, level="INFO"):
+                self._delay("ok", 4 * 3600)
+
+    def test_rollover_settles_back_to_normal_cadence(self):
+        """The post-reset payload advertises a fresh ~5h boundary, so the
+        pulled-forward poll costs exactly one extra request, not a fast loop."""
+        self.assertEqual(self._delay("ok", 120), 120 + cq._RESET_GRACE_SECONDS)
+        after_reset = _NOW + timedelta(seconds=135)
+        fresh = _payload(five_hour=(after_reset + timedelta(hours=5)).isoformat())
+        self.assertEqual(cq.next_poll_delay("ok", fresh, after_reset), 900)
 
 
 class InitialPollDelayTests(unittest.TestCase):
