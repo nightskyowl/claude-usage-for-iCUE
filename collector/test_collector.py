@@ -2118,7 +2118,11 @@ class ResetAwarePollDelayTests(unittest.TestCase):
 
 class InitialPollDelayTests(unittest.TestCase):
     """initial_poll_delay(): pure, thread-free helper that defers the
-    startup poll when the on-disk data file already reflects a recent 429."""
+    startup poll when the on-disk data file already reflects a recent 429.
+    The guard window is _rate_limit_guard_seconds() = max(POLL_SECONDS,
+    900), the same floored base next_poll_delay() uses for 429 backoff, so a
+    fast opt-in cadence can't shrink the protection against restart-hammering
+    a rate-limited endpoint."""
 
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
@@ -2172,6 +2176,69 @@ class InitialPollDelayTests(unittest.TestCase):
 
     def test_missing_file_polls_immediately(self):
         self.assertEqual(cq.initial_poll_delay(self.data_path), 0)
+
+    def test_default_cadence_defers_by_the_full_900s_regression(self):
+        """Regression guard: at the untouched default (900), behaviour must
+        stay exactly what it was before _rate_limit_guard_seconds() existed."""
+        cq.POLL_SECONDS = 900
+        self._write(cq._RATE_LIMIT_MESSAGE, age_seconds=60)
+        delay = cq.initial_poll_delay(self.data_path)
+        self.assertGreater(delay, 0)
+        self.assertLessEqual(delay, 900)
+        self.assertAlmostEqual(delay, 840, delta=5)
+
+    def test_fast_cadence_does_not_shrink_the_guard(self):
+        """The actual bug: at the 45s floor, a guard keyed on POLL_SECONDS
+        alone would collapse to ~45s. It must still defer by ~900s -- the
+        same floor next_poll_delay() uses for its 429 backoff base."""
+        cq.POLL_SECONDS = 45
+        self._write(cq._RATE_LIMIT_MESSAGE, age_seconds=60)
+        delay = cq.initial_poll_delay(self.data_path)
+        self.assertGreater(delay, 45)
+        self.assertAlmostEqual(delay, 840, delta=5)
+
+    def test_slow_cadence_uses_its_own_longer_guard(self):
+        """A POLL_SECONDS slower than the 900s floor must not be reduced down
+        to 900s -- the guard is a max(), never a min()."""
+        cq.POLL_SECONDS = 3600
+        self._write(cq._RATE_LIMIT_MESSAGE, age_seconds=60)
+        delay = cq.initial_poll_delay(self.data_path)
+        self.assertGreater(delay, 900)
+        self.assertAlmostEqual(delay, 3540, delta=5)
+
+    def test_429_older_than_guard_window_polls_immediately_at_any_cadence(self):
+        """The guard window is bounded below by 900s regardless of cadence, so
+        a 429 state old enough to clear even the slowest of these must poll
+        immediately whether POLL_SECONDS is fast, default, or slow."""
+        for poll_seconds in (45, 900, 3600):
+            with self.subTest(poll_seconds=poll_seconds):
+                cq.POLL_SECONDS = poll_seconds
+                self._write(cq._RATE_LIMIT_MESSAGE, age_seconds=4000)
+                self.assertEqual(cq.initial_poll_delay(self.data_path), 0)
+
+    def test_non_429_and_ok_states_poll_immediately_at_fast_cadence(self):
+        """The guard is specific to rate-limit state -- it must not leak into
+        other error kinds or the ok state, even at the fastest cadence."""
+        cq.POLL_SECONDS = 45
+        self._write("some other error", age_seconds=1)
+        self.assertEqual(cq.initial_poll_delay(self.data_path), 0)
+
+        data = {
+            "ok": True,
+            "stale": False,
+            "error": None,
+            "fetched_at": "2026-08-12T08:00:00Z",
+            "five_hour": {"utilization": 1, "resets_at": "x"},
+            "seven_day": {"utilization": 2, "resets_at": "y"},
+        }
+        cq._atomic_write_json(self.data_path, data)
+        self.assertEqual(cq.initial_poll_delay(self.data_path), 0)
+
+    def test_rate_limit_guard_seconds_takes_the_max(self):
+        cq.POLL_SECONDS = 45
+        self.assertEqual(cq._rate_limit_guard_seconds(), 900)
+        cq.POLL_SECONDS = 3600
+        self.assertEqual(cq._rate_limit_guard_seconds(), 3600)
 
 
 # --------------------------------------------------------------------------

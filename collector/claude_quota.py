@@ -849,6 +849,19 @@ _MAX_BACKOFF_SECONDS = 7200
 # no matter how fast the collector is polling when it trips.
 _MIN_BACKOFF_BASE_SECONDS = 900
 
+
+def _rate_limit_guard_seconds() -> int:
+    """Floor for any delay whose whole purpose is to protect a rate-limited
+    endpoint from being re-hit -- the 429 backoff base and the startup guard
+    in initial_poll_delay() both call this rather than using POLL_SECONDS
+    directly. A fast opt-in cadence must not be allowed to shrink either
+    protection: read at call time (not cached at import time) because
+    POLL_SECONDS can change under test and, in principle, across a config
+    reload.
+    """
+    return max(POLL_SECONDS, _MIN_BACKOFF_BASE_SECONDS)
+
+
 # Retry-After (seconds) reported by the most recent 429, when the server sent
 # a parseable one. Reset on any non-429 outcome.
 _last_retry_after: Optional[int] = None
@@ -1019,9 +1032,12 @@ def next_poll_delay(
     outcome kind ("ok" | "429" | "auth" | "other") of the poll cycle that
     just ran.
 
-    Consecutive 429s back off exponentially: min(POLL_SECONDS *
-    2**consecutive_429s, _MAX_BACKOFF_SECONDS). Any non-429 outcome resets
-    the counter and returns the normal POLL_SECONDS interval.
+    Consecutive 429s back off exponentially from a floored base: min(
+    _rate_limit_guard_seconds() * 2**consecutive_429s, _MAX_BACKOFF_SECONDS).
+    A server-provided Retry-After longer than that ladder overrides it (a
+    shorter one is ignored -- the ladder is already the more conservative of
+    the two). Any non-429 outcome resets the counter and returns the normal
+    POLL_SECONDS interval.
 
     On a successful cycle, `data` (the freshly written payload) is consulted so
     the next poll can be pulled forward to just after an imminent window reset
@@ -1032,7 +1048,7 @@ def next_poll_delay(
     global _consecutive_429s
     if status_kind == "429":
         _consecutive_429s += 1
-        base = max(POLL_SECONDS, _MIN_BACKOFF_BASE_SECONDS)
+        base = _rate_limit_guard_seconds()
         delay = min(base * (2 ** _consecutive_429s), _MAX_BACKOFF_SECONDS)
         if _last_retry_after is not None and _last_retry_after > delay:
             # The server named a longer wait than our ladder. Obey it: it is
@@ -1201,10 +1217,10 @@ def initial_poll_delay(path: Path = None) -> int:
 
     Normally 0 (poll immediately -- needed for fresh installs). But if the
     data file on disk already reflects a recent 429 rate-limit failure (exact
-    _RATE_LIMIT_MESSAGE, file mtime younger than POLL_SECONDS), return the
-    remaining seconds instead, so that repeated collector restarts right
-    after a 429 don't immediately re-hammer the endpoint. Pure / side-effect
-    free so it's unit-testable without threads.
+    _RATE_LIMIT_MESSAGE, file mtime younger than _rate_limit_guard_seconds()),
+    return the remaining seconds instead, so that repeated collector restarts
+    right after a 429 don't immediately re-hammer the endpoint. Pure /
+    side-effect free so it's unit-testable without threads.
     """
     path = path or DATA_PATH
     try:
@@ -1216,10 +1232,17 @@ def initial_poll_delay(path: Path = None) -> int:
     if data.get("error") != _RATE_LIMIT_MESSAGE:
         return 0
 
+    # Same floor as the 429 backoff base, and for the same reason: this guard
+    # exists to stop a restart loop from re-hammering an endpoint that has
+    # already rate-limited us, and that protection must not shrink just
+    # because a fast opt-in cadence is configured. Using POLL_SECONDS alone
+    # would collapse a 15-minute guard to 45 seconds at the fastest opt-in
+    # cadence -- weakest exactly when the collector is polling hardest.
+    guard = _rate_limit_guard_seconds()
     age = time.time() - mtime
-    if age >= POLL_SECONDS:
+    if age >= guard:
         return 0
-    return max(0, int(POLL_SECONDS - age))
+    return max(0, int(guard - age))
 
 
 def _fmt_util(window: Optional[dict]) -> str:
