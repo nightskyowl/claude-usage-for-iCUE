@@ -1,13 +1,30 @@
 # Phase 2b — sub-60-second glass latency
 
-**Status: started 2026-08-12. Prerequisites done; live on rung 1 (300 s).**
+**Status: COMPLETE. Target met and measured. Rung 4 (45 s) live since 2026-08-13 08:46.**
 
 | | State |
 |---|---|
-| Prerequisite code | ✅ done — floor/default split, backoff decoupled, `Retry-After` honoured |
-| Widget | ✅ 1.0.4 deployed (`W` = 2 s) — **needs an iCUE tray quit + relaunch to take effect** |
-| Cadence | ✅ rung 1 live: `CLAUDE_QUOTA_POLL_SECONDS=300` (persistent user env var) |
-| Next | observe ≥24 h for 429s, then rung 2 (120 s) |
+| Prerequisite code | ✅ floor/default split, backoff decoupled, `Retry-After`, restart guard decoupled |
+| Widget | ✅ `W` = 2 s (shipped in 1.0.4, carried into 1.1.0 Editorial Bands) |
+| Cadence | ✅ `CLAUDE_QUOTA_POLL_SECONDS=45` (persistent user env var) |
+| **Measured glass latency** | **47.8 s worst case** — under the 60 s target |
+| Now | one-day observation at 45 s; user reports any problem |
+
+### The measurement (2026-08-13 08:47–08:52)
+
+Sampled the collector's JSON on the widget's own 2 s rhythm, 150 samples, 0 errors.
+Poll gaps were a consistent 45–46 s.
+
+```
+MAX data age observed : 45.8 s      ← worst case at the JSON layer
++ widget refresh      :  2.0 s
+= worst-case glass    : 47.8 s      ← target was < 60 s ✓
+localhost fetch       : avg 3.1 ms  ← render is not a meaningful term
+```
+
+Rungs 2 (120 s) and 3 (60 s) were **deliberately skipped**: 60 s yields ~62 s worst case and
+so misses the target, making it a rung worth visiting only as a *fallback*. If 45 s ever
+trips a 429, step down 60 → 120 → 300 rather than straight to the default.
 
 Phase 2a (activity-driven idle pausing) shipped earlier the same day and was confirmed in
 production at 19:53–19:57: the collector held polls for 1125 s while idle and resumed

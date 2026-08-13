@@ -23,13 +23,21 @@ progress bars with percentage and reset time.
      never the floor, so a typo can't silently produce the fastest possible cadence).
      Keeping the default at 900 is what makes rollback free: removing the env var fully
      reverts the polling rate with no code change (`collector/rollback_cadence.bat`).
-   - **429 backoff is deliberately decoupled from `POLL_SECONDS`**: the ladder is
-     `max(POLL_SECONDS, _MIN_BACKOFF_BASE_SECONDS=900) * 2**n`, capped at 2 h. Basing it on
-     `POLL_SECONDS` alone (as it originally was) meant a fast cadence also made the retreat
-     from a rate limit shallow — at 45 s it would take *eight* 429s to reach the 2 h cap
-     instead of three, i.e. eight requests into an endpoint that has already said no.
+   - **Rate-limit protections are deliberately decoupled from `POLL_SECONDS`.** Both call
+     `_rate_limit_guard_seconds()` = `max(POLL_SECONDS, _MIN_BACKOFF_BASE_SECONDS=900)`, read
+     at call time so they cannot drift apart:
+     - the 429 backoff ladder (`guard * 2**n`, capped at 2 h). Basing it on `POLL_SECONDS`
+       alone (as it originally was) meant a fast cadence also made the retreat from a rate
+       limit shallow — at 45 s it would take *eight* 429s to reach the 2 h cap instead of
+       three, i.e. eight requests into an endpoint that has already said no.
+     - `initial_poll_delay()`'s restart guard, which is what makes "restarting the collector
+       repeatedly is safe" true. On a bare `POLL_SECONDS` it collapsed from 15 minutes to
+       45 s at the fastest cadence — weakest exactly when polling hardest.
      A `Retry-After` header is honoured when it asks for **longer** than the ladder; a
      shorter one is ignored, since the ladder is the more conservative of the two.
+     **This is a bug *class*, not two bugs**: before lowering any floor, grep every reference
+     to the constant and ask whether each use is there because it *is* the cadence, or merely
+     because it happened to be big enough. See `docs/phase-2b-plan.md`.
    - **Reset-aware scheduling**: on a successful cycle the next poll is pulled forward to
      just after the soonest upcoming `resets_at` (+15 s grace, floored at 60 s) when that
      lands sooner than the normal interval. This fixes the one visibly-wrong state — a
@@ -159,6 +167,12 @@ progress bars with percentage and reset time.
   and with it the widget's dashboard placement and configured properties (serverPort, colors).
   Importing through the iCUE UI instead registers a *new* GUID and forces re-placing and
   reconfiguring the widget.
+- **Never put a pre-deploy backup inside `html_widgets\`.** iCUE scans *every* subfolder there
+  at launch, so a `<guid>.bak-1.0.4` folder registers as a second widget with the **same**
+  `id` and name. This happened on 2026-08-13 during the 1.1.0 deploy; iCUE relaunched seeing
+  two "Claude Quota" widgets. Backups belong in `%LOCALAPPDATA%\ClaudeQuotaBackups\`.
+  `robocopy <stage> <target> /E` (no `/PURGE`) is the deploy command that works — PowerShell
+  `Copy-Item -Force` / `Move-Item -Force` trip the sandbox's removal guard.
 - **iCUE reads widget files only once, at launch.** After deploying, iCUE must be fully quit
   from its **system-tray icon** (right-click → Quit) and relaunched. Clicking ✕ only minimises
   to the tray, so the process keeps rendering the version it loaded at startup — which looks
