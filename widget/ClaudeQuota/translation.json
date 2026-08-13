@@ -16,7 +16,8 @@
       "Resets {value}": "Resets {value}",
       "Resets in {value}": "Resets in {value}",
       "Updated {value} ago": "Updated {value} ago",
-      "Just now": "Just now"
+      "Just now": "Just now",
+      "Window not started": "Window not started"
     }
   }
 }

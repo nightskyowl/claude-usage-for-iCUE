@@ -4,24 +4,34 @@
   --bg-color: #000000;
   --bg-opacity: 1;
 
+  /* Wash colors are written by JS per utilization band (see fillColor/washFor).
+     Defaults are the neutral "no data" wash so the first paint is never bare. */
+  --wash-line: rgba(255, 255, 255, 0.18);
+  --wash-a: rgba(255, 255, 255, 0.03);
+  --wash-b: rgba(255, 255, 255, 0.08);
+
   /* Sizing architecture — components consume semantic tokens only.
      Media queries override the active baseline, not individual fonts. */
   --layout-unit: 1vmin;
   --device-vertical-s-unit: 4.16px; /* 416px / 100 — S-vertical canonical baseline */
 
-  --space-gap: calc(var(--layout-unit) * 5);
-  --space-pad-v: calc(var(--layout-unit) * 6);
-  --space-pad-h: calc(var(--layout-unit) * 8);
-  --radius-bar: calc(var(--layout-unit) * 2.5);
-  --radius-badge: calc(var(--layout-unit) * 2);
+  --space-pad-h: calc(var(--layout-unit) * 6);
+  --rule-color: rgba(255, 255, 255, 0.09);
 
-  --font-percent: calc(var(--layout-unit) * 13);
-  --font-label: calc(var(--layout-unit) * 5);
-  --font-reset: calc(var(--layout-unit) * 3.6);
-  --font-badge: calc(var(--layout-unit) * 3);
+  /* Editorial hierarchy: the percentage is the hero, everything else is caption
+     scale. The freshness line sits above caption scale on purpose — see below. */
+  --font-percent: calc(var(--layout-unit) * 26);
+  --font-pctsign: calc(var(--layout-unit) * 8);
+  --font-label: calc(var(--layout-unit) * 4.2);
+  --font-reset: calc(var(--layout-unit) * 4.2);
+  --font-badge: calc(var(--layout-unit) * 3.4);
   --font-state: calc(var(--layout-unit) * 5);
 
-  --bar-height: calc(var(--layout-unit) * 5);
+  /* Data age is the only line that tells you whether to trust the figures, so it
+     is set larger and brighter than the badges it sits next to — not as fine
+     print. Deliberately ~50% larger than the old badge scale. */
+  --font-fresh: calc(var(--layout-unit) * 5.4);
+  --dot-size: calc(var(--layout-unit) * 1.9);
 }
 
 html { overflow: hidden; }
@@ -61,13 +71,14 @@ body {
   background-color: var(--bg-color);
 }
 
+/* No padding here: the bands are full-bleed, so each region owns its own
+   inset. Padding on this element would inset the washes too. */
 .main-content {
   position: relative;
   z-index: 2;
   box-sizing: border-box;
   width: 100%;
   height: 100%;
-  padding: var(--space-pad-v) var(--space-pad-h);
   display: flex;
   flex-direction: column;
 }
@@ -88,35 +99,48 @@ body {
   flex-direction: column;
   height: 100%;
   width: 100%;
-  gap: calc(var(--layout-unit) * 2);
 }
+
+/* ---------- header rail ---------- */
 
 .top-bar {
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
-  justify-content: flex-end;
   gap: calc(var(--layout-unit) * 2);
-  min-height: calc(var(--layout-unit) * 5);
-  flex: 0 0 auto;
+  padding: calc(var(--layout-unit) * 3.2) var(--space-pad-h) calc(var(--layout-unit) * 2.6);
+  border-bottom: 1px solid var(--rule-color);
 }
 
-/* Age of the displayed figures. margin-right:auto pins it left while the
-   badges stay right-aligned in the flex-end top bar. tabular-nums keeps the
-   1 Hz digits from shifting the text width as they tick. */
+/* Age of the displayed figures. Leads the rail — it is read before the badges,
+   which is why it is left-aligned and they are pushed right. tabular-nums keeps
+   the 1 Hz digits from shifting the text width as they tick. */
 .freshness {
-  font-size: var(--font-badge);
-  opacity: 0.45;
+  font-size: var(--font-fresh);
+  opacity: 0.9;
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
-  margin-right: auto;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
+/* Encodes the same state as the badges in a form that reads at a glance, so the
+   header carries status even when the badge text is too small to parse. */
+.fresh-dot {
+  flex: 0 0 auto;
+  width: var(--dot-size);
+  height: var(--dot-size);
+  border-radius: 50%;
+  background: #3ddc84;
+  transition: background-color 0.3s ease;
+}
+.content.is-stale .fresh-dot { background: #f5a623; }
+.content.is-offline .fresh-dot { background: #ff4d4d; }
+
 .offline-banner {
   display: none;
   align-items: center;
-  gap: calc(var(--layout-unit) * 1.5);
+  margin-left: auto;
   font-size: var(--font-badge);
   opacity: 0.9;
   color: #ff9d9d;
@@ -128,8 +152,8 @@ body {
   display: none;
   align-items: center;
   font-size: var(--font-badge);
-  padding: calc(var(--layout-unit) * 0.8) calc(var(--layout-unit) * 2);
-  border-radius: var(--radius-badge);
+  padding: calc(var(--layout-unit) * 0.7) calc(var(--layout-unit) * 2);
+  border-radius: calc(var(--layout-unit) * 2);
   background: rgba(255, 255, 255, 0.14);
   opacity: 0.85;
   letter-spacing: 0.05em;
@@ -137,29 +161,72 @@ body {
   white-space: nowrap;
 }
 .content.is-stale .stale-badge { display: inline-flex; }
+/* Whichever badge appears first takes the auto margin that pushes the group right. */
+.content.is-stale .stale-badge { margin-left: auto; }
+.content.is-stale.is-offline .offline-banner { margin-left: 0; }
+
+/* ---------- the bands ---------- */
 
 .rows {
   display: flex;
   flex-direction: column;
-  justify-content: space-evenly;
   flex: 1;
   min-height: 0;
-  gap: var(--space-gap);
 }
 
+/* The row IS the meter: the wash fills the full height of the band, so there is
+   no leftover vertical space to waste and no separate track to draw. */
 .quota-row {
+  position: relative;
+  flex: 1;
+  min-height: 0;
   display: flex;
-  flex-direction: column;
-  justify-content: center;
-  gap: calc(var(--layout-unit) * 1.6);
-  min-width: 0;
+  align-items: center;
+  padding: 0 var(--space-pad-h);
+  overflow: hidden;
+}
+.quota-row + .quota-row { border-top: 1px solid var(--rule-color); }
+
+/* At 0% the wash has no width but the lit edge still renders at x=0, so an empty
+   window reads as "untouched", never as "no data". */
+.band-wash {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 0;
+  z-index: 1;
+  background-image: linear-gradient(90deg, var(--wash-a), var(--wash-b));
+  border-right: calc(var(--layout-unit) * 0.7) solid var(--wash-line);
+  transition: width 0.5s ease, border-color 0.5s ease;
 }
 
-.row-top {
+.band-content {
+  position: relative;
+  z-index: 2;
   display: flex;
   align-items: baseline;
-  justify-content: space-between;
-  gap: calc(var(--layout-unit) * 3);
+  width: 100%;
+  min-width: 0;
+  gap: calc(var(--layout-unit) * 3.5);
+}
+
+.row-percent {
+  font-size: var(--font-percent);
+  font-weight: 700;
+  line-height: 0.8;
+  letter-spacing: -0.015em;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  color: var(--text-color);
+  flex: 0 0 auto;
+}
+
+.pct-sign {
+  font-size: var(--font-pctsign);
+  font-weight: 600;
+  opacity: 0.45;
+  margin-left: calc(var(--layout-unit) * 0.6);
 }
 
 .row-label {
@@ -168,43 +235,20 @@ body {
   color: var(--accent-color);
   opacity: 0.9;
   text-transform: uppercase;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.2em;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-}
-
-.row-percent {
-  font-size: var(--font-percent);
-  font-weight: 700;
-  font-variant-numeric: tabular-nums;
-  line-height: 1;
-  white-space: nowrap;
-  color: var(--text-color);
-}
-
-.bar-track {
-  position: relative;
-  width: 100%;
-  height: var(--bar-height);
-  background: rgba(255, 255, 255, 0.12);
-  border-radius: var(--radius-bar);
-  overflow: hidden;
-}
-
-.bar-fill {
-  position: absolute;
-  inset: 0;
-  width: 0%;
-  border-radius: var(--radius-bar);
-  background-color: rgba(255, 255, 255, 0.12);
-  transition: width 0.5s ease, background-color 0.5s ease;
+  min-width: 0;
 }
 
 .row-reset {
+  margin-left: auto;
+  text-align: right;
   font-size: var(--font-reset);
-  opacity: 0.55;
+  opacity: 0.8;
   white-space: nowrap;
+  flex: 0 0 auto;
   /* Countdown ticks once a second — proportional digits would visibly wobble
      the line width, so pin to tabular figures. */
   font-variant-numeric: tabular-nums;
@@ -212,24 +256,26 @@ body {
 
 /* Vertical Xeneon Edge slots (S/M/L/XL-V) share width ~696 — pin to the
    S-vertical baseline per Rule 5 so M/L/XL vertical don't inflate typography;
-   extra height is absorbed by `.rows` justify-content: space-evenly instead. */
+   the bands absorb the extra height and their content stays vertically centered. */
 @media (min-width: 680px) and (max-width: 712px) and (min-height: 416px) {
   :root { --layout-unit: var(--device-vertical-s-unit); }
 }
 
-/* Wide landscape layouts (S-H, L-H, XL-H): side-by-side columns make better
-   use of the extra width than a tall stack. */
-@media (min-aspect-ratio: 1.9) {
-  .rows { flex-direction: row; align-items: stretch; }
-  .quota-row { flex: 1; }
+/* Wide slots (L-H 1688, XL-H 2536): cap the reading line so the percentage and
+   its reset time don't end up a metre apart. Left-anchored, never centered —
+   the numeral has to stay aligned with the wash origin or the two stop reading
+   as one object. */
+@media (min-width: 1200px) {
+  .band-content { max-width: 1100px; }
 }
 
-/* S-H only (short + wide, 840x344): hide the reset line (Rule 6 — hide,
-   don't shrink) and tighten padding so the hero percentages stay uncramped. */
+/* Short wide slot (S-H 840x344): the rail is the only fixed-height region, so
+   trim its padding to give the bands more of the panel. The reset line is NOT
+   hidden here — it costs no vertical space in this layout. */
 @media (min-aspect-ratio: 2.2) and (max-height: 400px) {
-  .row-reset { display: none; }
-  .main-content { padding: calc(var(--layout-unit) * 5) calc(var(--layout-unit) * 7); }
-  .top-bar { min-height: calc(var(--layout-unit) * 4); }
+  .top-bar {
+    padding: calc(var(--layout-unit) * 3.6) var(--space-pad-h) calc(var(--layout-unit) * 2.8);
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {

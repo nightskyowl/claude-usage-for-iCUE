@@ -38,6 +38,7 @@
 
       <div class="content">
         <div class="top-bar">
+          <span class="fresh-dot" aria-hidden="true"></span>
           <span class="freshness"></span>
           <span class="stale-badge">Stale</span>
           <span class="offline-banner">Collector offline</span>
@@ -45,21 +46,21 @@
 
         <div class="rows">
           <div class="quota-row" data-window="five_hour">
-            <div class="row-top">
+            <div class="band-wash"></div>
+            <div class="band-content">
+              <span class="row-percent"><span class="pct-num">--</span><span class="pct-sign">%</span></span>
               <span class="row-label">5-Hour Window</span>
-              <span class="row-percent">--%</span>
+              <span class="row-reset"></span>
             </div>
-            <div class="bar-track"><div class="bar-fill"></div></div>
-            <div class="row-reset"></div>
           </div>
 
           <div class="quota-row" data-window="seven_day">
-            <div class="row-top">
+            <div class="band-wash"></div>
+            <div class="band-content">
+              <span class="row-percent"><span class="pct-num">--</span><span class="pct-sign">%</span></span>
               <span class="row-label">Weekly Window</span>
-              <span class="row-percent">--%</span>
+              <span class="row-reset"></span>
             </div>
-            <div class="bar-track"><div class="bar-fill"></div></div>
-            <div class="row-reset"></div>
           </div>
         </div>
       </div>
@@ -102,6 +103,7 @@
     var resetsInTemplate = 'Resets in {value}';
     var updatedTemplate = 'Updated {value} ago';
     var justNowText = 'Just now';
+    var notStartedText = 'Window not started';
     // 1 Hz repaint of the time-derived text only (countdown + data age). Costs no
     // network traffic of any kind — it re-reads clocks, never the collector.
     var tickTimer = null;
@@ -118,7 +120,8 @@
       'Resets {value}': 'Resets {value}',
       'Resets in {value}': 'Resets in {value}',
       'Updated {value} ago': 'Updated {value} ago',
-      'Just now': 'Just now'
+      'Just now': 'Just now',
+      'Window not started': 'Window not started'
     };
 
     function trText(key) {
@@ -169,16 +172,19 @@
         trText('Resets {value}'),
         trText('Resets in {value}'),
         trText('Updated {value} ago'),
-        trText('Just now')
+        trText('Just now'),
+        trText('Window not started')
       ]).then(function (vals) {
         var loadingText = vals[0], offlineText = vals[1], staleText = vals[2],
             fiveHourLabel = vals[3], weeklyLabel = vals[4], resetsTpl = vals[5],
-            resetsInTpl = vals[6], updatedTpl = vals[7], justNowTxt = vals[8];
+            resetsInTpl = vals[6], updatedTpl = vals[7], justNowTxt = vals[8],
+            notStartedTxt = vals[9];
 
         resetsTemplate = resetsTpl || 'Resets {value}';
         resetsInTemplate = resetsInTpl || 'Resets in {value}';
         updatedTemplate = updatedTpl || 'Updated {value} ago';
         justNowText = justNowTxt || 'Just now';
+        notStartedText = notStartedTxt || 'Window not started';
 
         var loadingEl = document.querySelector('.loading-state');
         if (loadingEl) loadingEl.textContent = loadingText;
@@ -257,11 +263,13 @@
       return Math.floor(totalSec / 3600) + 'h ' + Math.floor((totalSec % 3600) / 60) + 'm';
     }
 
-    function formatResetLine(iso) {
+    function formatResetLine(iso, hasData) {
       // resets_at is nullable in the SUCCESS path: right after a window rolls
       // over the API reports utilization 0 with no next boundary until the
-      // window restarts. Render nothing rather than "Invalid Date".
-      if (!iso) return '';
+      // window restarts. That is a real, nameable state — say so rather than
+      // leaving a hole. Only when there is no window payload at all do we
+      // render nothing, because then we genuinely don't know.
+      if (!iso) return hasData ? notStartedText : '';
       var d = new Date(iso);
       if (isNaN(d.getTime())) return '';
 
@@ -299,29 +307,39 @@
       return updatedTemplate.replace('{value}', value);
     }
 
-    // --- Bar color thresholds (fixed regardless of accentColor) ---
-    function fillColor(v) {
-      if (v === null) return 'rgba(255,255,255,0.12)';
-      if (v > 90) return '#ff4d4d';
-      if (v >= 70) return '#f5a623';
-      return '#3ddc84';
+    // --- Wash colors by utilization (fixed regardless of accentColor) ---
+    // Written as literal rgba strings rather than color-mix() so the gradient
+    // renders on older Chromium builds embedded in iCUE.
+    var WASH_NONE = { line: 'rgba(255,255,255,0.18)', a: 'rgba(255,255,255,0.03)', b: 'rgba(255,255,255,0.08)' };
+    var WASH_OK   = { line: '#3ddc84', a: 'rgba(61,220,132,0.08)', b: 'rgba(61,220,132,0.30)' };
+    var WASH_WARN = { line: '#f5a623', a: 'rgba(245,166,35,0.08)', b: 'rgba(245,166,35,0.32)' };
+    var WASH_CRIT = { line: '#ff4d4d', a: 'rgba(255,77,77,0.10)',  b: 'rgba(255,77,77,0.36)' };
+
+    function washFor(v) {
+      if (v === null) return WASH_NONE;
+      if (v > 90) return WASH_CRIT;
+      if (v >= 70) return WASH_WARN;
+      return WASH_OK;
     }
 
     function renderWindow(selector, windowData) {
       var row = document.querySelector('.quota-row[data-window="' + selector + '"]');
       if (!row) return;
-      var percentEl = row.querySelector('.row-percent');
-      var fillEl = row.querySelector('.bar-fill');
+      var numEl = row.querySelector('.pct-num');
+      var washEl = row.querySelector('.band-wash');
       var resetEl = row.querySelector('.row-reset');
 
       var util = windowData && typeof windowData.utilization !== 'undefined' ? clampPercent(windowData.utilization) : null;
 
-      if (percentEl) percentEl.textContent = util === null ? '--%' : Math.round(util) + '%';
-      if (fillEl) {
-        fillEl.style.width = (util === null ? 0 : util) + '%';
-        fillEl.style.backgroundColor = fillColor(util);
+      if (numEl) numEl.textContent = util === null ? '--' : String(Math.round(util));
+      if (washEl) {
+        var w = washFor(util);
+        washEl.style.width = (util === null ? 0 : util) + '%';
+        washEl.style.setProperty('--wash-line', w.line);
+        washEl.style.setProperty('--wash-a', w.a);
+        washEl.style.setProperty('--wash-b', w.b);
       }
-      if (resetEl) resetEl.textContent = formatResetLine(windowData ? windowData.resets_at : null);
+      if (resetEl) resetEl.textContent = formatResetLine(windowData ? windowData.resets_at : null, !!windowData);
     }
 
     // Time-derived text only — no bar geometry, no colors. Safe to run at 1 Hz
@@ -336,7 +354,7 @@
         var row = document.querySelector('.quota-row[data-window="' + rows[i][0] + '"]');
         if (!row) continue;
         var resetEl = row.querySelector('.row-reset');
-        if (resetEl) resetEl.textContent = formatResetLine(rows[i][1] ? rows[i][1].resets_at : null);
+        if (resetEl) resetEl.textContent = formatResetLine(rows[i][1] ? rows[i][1].resets_at : null, !!rows[i][1]);
       }
       var freshEl = document.querySelector('.freshness');
       if (freshEl) freshEl.textContent = lastGoodData ? formatFreshness(lastGoodData.fetched_at) : '';

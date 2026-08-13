@@ -65,14 +65,17 @@ progress bars with percentage and reset time.
    `http://127.0.0.1:8765/latest.json` with `Access-Control-Allow-Origin: *`.
 3. **Widget** (`widget/ClaudeQuota/`) — pure renderer. Fetches only the localhost JSON.
    **Holds no tokens, never calls Anthropic directly.** Re-reads `latest.json` every
-   **5 s** (`REFRESH_INTERVAL_MS`); this is localhost-only traffic and adds zero API load,
-   so it is deliberately decoupled from the collector's 15-minute cadence.
+   **2 s** (`REFRESH_INTERVAL_MS`), backing off to `FAST_RETRY_MS` = 5 s until the first
+   success and whenever the last fetch failed; this is localhost-only traffic and adds zero
+   API load, so it is deliberately decoupled from the collector's 15-minute cadence.
    - A **1 Hz tick** (`renderLive()`) repaints only time-derived text: the reset countdown
-     and the data-age line. It touches no bar geometry or colors, so it can never restart
-     the `width`/`background-color` CSS transitions. Costs zero network traffic of any kind.
+     and the data-age line. It touches no wash geometry or colors, so it can never restart
+     the `width` CSS transition. Costs zero network traffic of any kind.
    - **Reset line**: countdown (`Resets in 4m 12s`) when the boundary is under 24 h away,
-     seconds precision under an hour; absolute wall clock beyond a day, when `resets_at` is
-     already past (stale snapshot), and never rendered at all when it is null.
+     seconds precision under an hour; absolute wall clock beyond a day and when `resets_at`
+     is already past (stale snapshot); **`Window not started`** when `resets_at` is null but
+     the window payload exists (the real post-rollover state); empty only when there is no
+     window payload at all, i.e. when we genuinely do not know.
    - **Never interpolate the percentage between polls.** A projected quota figure that reads
      high causes needless throttling and one that reads low walks the user into the cap. The
      countdown supplies the live-motion feel without inventing data.
@@ -88,7 +91,13 @@ progress bars with percentage and reset time.
 
 - Layout: responsive, all Xeneon Edge sizes (S/M/L/XL, horizontal + vertical), token-driven CSS
 - Style: iCUE native dark; supports Xeneon Edge "Custom Style" (textColor/backgroundColor/…)
-- Bar colors by utilization: green < 70 %, amber 70–90 %, red > 90 %
+- **Widget UI is "Editorial Bands" (v1.1.0)** — chosen by the user from five studies. Each
+  window is a full-height band whose background wash *is* the meter, with a hero percentage,
+  the label in `accentColor`, and the reset line inline on the right. See
+  `docs/widget-ui-editorial-bands.md` for the rules that keep it coherent.
+- Wash colors by utilization: green < 70 %, amber 70–90 %, red > 90 %. Written by JS as
+  literal `rgba()` strings, **not** `color-mix()` — the latter is Chromium 111+ and the iCUE
+  webview cannot be assumed that new.
 - Runtime: Python (stdlib only), single process for collector + server
 - Widget name **Claude Quota**, id `com.sir.claudequota`, author "Sir", MIT, port **8765**
 
@@ -98,7 +107,9 @@ progress bars with percentage and reset time.
   read `SKILL.md`, `docs/`, `references/` before touching widget code).
 - Validate/package with the official CLI: `npm i -g icuewidget-cli`, then
   `icuewidget validate widget/ClaudeQuota` and `icuewidget package widget/ClaudeQuota`.
-  Packaged output goes to `dist/ClaudeQuota.icuewidget`.
+  **The CLI writes the package next to the source as `widget/claude-quota.icuewidget`** (kebab
+  case, CLI 0.4.47) — it does *not* write to `dist/`. Move it to `dist/ClaudeQuota.icuewidget`
+  yourself; that path is this project's convention and what the deploy step reads.
 - Model policy: Sonnet implements clearly-specified tasks; Fable (or the strongest available
   model) plans, reviews, approves/denies, and sends work back with feedback.
 
